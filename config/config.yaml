@@ -1,0 +1,96 @@
+# ════════════════════════════════════════════════════
+# TAD Consensus Pipeline — конфигурация
+# ════════════════════════════════════════════════════
+
+project:
+  name: "TAD Consensus GM12878"
+  genome: "hg19"
+  cell_line: "GM12878"
+  seed: 42
+
+# ─── Пути ────────────────────────────────────────────
+paths:
+  raw_data:       "data/raw"
+  processed:      "data/processed"
+  reference:      "data/reference"
+  results:        "results"
+  tads_out:       "results/tads"
+  consensus_out:  "results/consensus"
+  stats_out:      "results/stats"
+  figures_out:    "results/figures"
+  report:         "results/report.html"
+  armatus_bin:    "tools/armatus/armatus"
+  coitad_dir:     "tools/coiTAD"
+
+  hic_file:       "data/raw/GSE63525_GM12878_insitu_primary_30.hic"
+  arrowhead_file: "data/reference/GSE63525_GM12878_primary+replicate_Arrowhead_domainlist.txt"
+  ctcf_bed:       "data/reference/GM12878_CTCF_peaks_hg19.bed"
+
+# ─── Разрешения и хромосомы ──────────────────────────
+resolutions:        [10000, 25000, 50000, 100000]   # в bp
+chromosomes:
+  all:    ["chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8",
+           "chr9","chr10","chr11","chr12","chr13","chr14","chr15",
+           "chr16","chr17","chr18","chr19","chr20","chr21","chr22","chrX"]
+  # scKTLD — ограничения памяти
+  scktld_limits:
+    10000:  ["chr21","chr22"]
+    25000:  ["chr17","chr18","chr19","chr20","chr21","chr22"]
+    50000:  ["chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8",
+             "chr9","chr10","chr11","chr12","chr13","chr14","chr15",
+             "chr16","chr17","chr18","chr19","chr20","chr21","chr22"]
+    100000: ["chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8",
+             "chr9","chr10","chr11","chr12","chr13","chr14","chr15",
+             "chr16","chr17","chr18","chr19","chr20","chr21","chr22"]
+
+# ─── Параметры алгоритмов ────────────────────────────
+algorithms:
+  armatus:
+    gamma_values:    [0.1, 0.5, 1.0, 2.0, 5.0]
+    stability_top_n: 3          # брать topN стабильных gamma
+
+  topdom:
+    window_sizes: [3, 5, 10]    # выбирается лучший по внутренней метрике
+    default_window: 5
+
+  scktld:
+    dimension: 128
+    balance: false              # RAW, без нормализации — требование авторов
+    auto_penalty: true
+
+  coitad:
+    default_params: {}          # параметры читаются из tools/coiTAD/config
+
+# ─── Консенсус ───────────────────────────────────────
+consensus:
+  tolerance_bins: 1             # ±1 bin при кластеризации
+  min_support: 2                # минимальное число алгоритмов
+  colors:
+    2: "#FFD700"   # жёлтый  — слабый
+    3: "#FF8C00"   # оранжевый — умеренный
+    4: "#00C800"   # зелёный  — сильный
+
+# ─── Валидация ───────────────────────────────────────
+validation:
+  ctcf_window_bp: 1             # ±1 bin от границы
+  n_permutations: 1000
+  enrichment_profile_range_bp: 500000   # ±500 kb
+  enrichment_profile_bin_bp:   10000    # 10 kb бин
+
+# ─── Сравнение с Rao 2014 ────────────────────────────
+rao_comparison:
+  tolerances_bins: [1, 2]       # ±1 и ±2 bin
+
+# ─── Визуализация ────────────────────────────────────
+visualization:
+  hic_colormap: "coolwarm"
+  hic_log_scale: true
+  dpi: 300
+  format: "png"
+  figsize: [18, 14]
+  generate_html: true           # plotly интерактивный
+  algorithm_colors:
+    armatus: "#1f77b4"
+    topdom:  "#ff7f0e"
+    scktld:  "#2ca02c"
+    coitad:  "#d62728"
