@@ -34,9 +34,6 @@ tad_consensus/
 
 ---
 
-## README.md
-
-```markdown
 # TAD Consensus Pipeline
 
 Сравнительный анализ детекции топологически ассоциированных доменов (TAD)
