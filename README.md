@@ -72,7 +72,7 @@ tad_consensus/
 
 ```bash
 # 1. Клонировать репозиторий
-git clone <repo_url> && cd tad_consensus
+git clone <repo_url> && cd tad_project
 
 # 2. Создать conda-окружение
 conda env create -f environment.yml
