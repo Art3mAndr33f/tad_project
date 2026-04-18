@@ -34,9 +34,6 @@ tad_consensus/
 
 ---
 
-## README.md
-
-```markdown
 # TAD Consensus Pipeline
 
 Сравнительный анализ детекции топологически ассоциированных доменов (TAD)
@@ -142,6 +139,7 @@ results/
 ├── figures/       # hic_tads_<chrom>_<resolution>.png
 └── report.html    # сводный интерактивный отчёт
 ```
+<<<<<<< HEAD
 
 ## Обновление правил проекта
 ```bash
@@ -149,3 +147,5 @@ python scripts/update_rules.py check        # проверить
 python scripts/update_rules.py add-algorithm <Name>  # новый алгоритм
 python scripts/update_rules.py changelog    # зафиксировать изменения
 ```
+=======
+>>>>>>> e516dc2480df2b5d9bd89745443958a8bcb5fb74
