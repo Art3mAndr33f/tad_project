@@ -3,20 +3,17 @@ run_scktld.py
 =============
 Адаптация scKTLD для bulk Hi-C данных.
 
-scKTLD (Single-Cell Kernel TAD Learning with Domains) адаптирован
-для работы с dense numpy-матрицами одной хромосомы (RAW, без нормализации).
+Алгоритм:
+  1. KNN-sparse RBF-граф на контактной матрице (без нормализации, RAW)
+  2. Нормализованный Лапласиан → eigsh → спектральное вложение
+  3. DP-сегментация с penalty (cumsum-ускорение)
+  4. _auto_penalty: logspace-сетка + фильтр min_tads/max_tads + elbow
 
 Ограничения памяти (из конфига):
   10 kb  → chr21, chr22
   25 kb  → chr17–chr22
   50 kb  → chr1–chr22
   100 kb → chr1–chr22
-
-Алгоритм:
-  1. KNN-граф на основе контактной матрицы (ядро RBF)
-  2. Спектральное вложение (dimension=128)
-  3. Сегментация через динамическое программирование с штрафом
-  4. penalty: автоподбор через grid search по внутренней оценке
 """
 
 from __future__ import annotations
@@ -27,7 +24,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, diags
 from scipy.sparse.linalg import eigsh
 from sklearn.preprocessing import normalize
 
@@ -35,154 +32,265 @@ from src.data_prep import get_matrix
 
 logger = logging.getLogger(__name__)
 
-RNG = np.random.default_rng(42)
+# ──────────────────────────────────────────────────────────────────────────────
+# Константы (переопределяются через cfg)
+# ──────────────────────────────────────────────────────────────────────────────
+_DEFAULT_DIMENSION = 32
+_DEFAULT_KNN_K     = 20
+_AUTO_MIN_TADS     = 20
+_AUTO_MAX_TADS     = 200
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ядерные функции
+# 1. KNN-sparse RBF-ядро
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _rbf_kernel_matrix(matrix: np.ndarray, sigma: Optional[float] = None) -> np.ndarray:
+def _rbf_kernel_matrix(
+    matrix: np.ndarray,
+    sigma: Optional[float] = None,
+    knn_k: int = _DEFAULT_KNN_K,
+) -> csr_matrix:
     """
-    Построить RBF-матрицу сходства из контактной матрицы.
-    K[i,j] = exp(- ||row_i - row_j||^2 / (2*sigma^2))
+    KNN-sparse RBF: для каждого бина оставляем knn_k ближайших соседей
+    внутри скользящего окна (Hi-C локален — дальние контакты шумные).
+
+    Возвращает симметричную csr_matrix (не dense).
     """
-    # log1p для стабилизации
-    M = np.log1p(matrix.astype(np.float64))
+    M = np.log1p(matrix.astype(np.float32))
     n = M.shape[0]
+    knn_k  = min(knn_k, n - 1)
+    WINDOW = min(500, n - 1)   # ≤500 бинов = ≤12.5 Mb @ 25 kb
 
-    # Вычисляем расстояния через squared norms
-    sq_norms = np.sum(M ** 2, axis=1, keepdims=True)
-    dists_sq = sq_norms + sq_norms.T - 2.0 * (M @ M.T)
-    np.clip(dists_sq, 0, None, out=dists_sq)
-
+    # Оцениваем sigma по выборке из 200 бинов
+    sample_idx = np.linspace(0, n - 1, min(200, n), dtype=int)
+    sample = M[sample_idx]
+    sq  = np.sum(sample ** 2, axis=1, keepdims=True)
+    d_s = sq + sq.T - 2.0 * (sample @ sample.T)
+    np.clip(d_s, 0, None, out=d_s)
     if sigma is None:
-        sigma = np.sqrt(np.median(dists_sq[dists_sq > 0])) if np.any(dists_sq > 0) else 1.0
+        nz = d_s[d_s > 0]
+        sigma = float(np.sqrt(np.median(nz))) if len(nz) > 0 else 1.0
+    inv_2s2 = 1.0 / (2.0 * sigma ** 2 + 1e-12)
 
-    K = np.exp(-dists_sq / (2.0 * sigma ** 2))
-    np.fill_diagonal(K, 0.0)
-    return K
+    rows, cols, vals = [], [], []
+    for i in range(n):
+        lo = max(0, i - WINDOW)
+        hi = min(n, i + WINDOW + 1)
+        chunk = M[lo:hi]
+        d2 = np.sum((chunk - M[i]) ** 2, axis=1)
+        k_local = min(knn_k, len(d2) - 1)
+        top_k   = np.argpartition(d2, k_local)[:k_local + 1]
+        for t in top_k:
+            j = lo + t
+            if j == i:
+                continue
+            w = float(np.exp(-d2[t] * inv_2s2))
+            rows.append(i);  cols.append(j);  vals.append(w)
+            rows.append(j);  cols.append(i);  vals.append(w)  # симметрия
+
+    return csr_matrix((vals, (rows, cols)), shape=(n, n))
 
 
-def _spectral_embedding(K: np.ndarray, dimension: int) -> np.ndarray:
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. Спектральное вложение
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _spectral_embedding(K: csr_matrix, dimension: int) -> np.ndarray:
     """
-    Спектральное вложение: нормализованный Лапласиан + eigsh.
-    Возвращает матрицу (n, dimension).
+    Нормализованный Лапласиан → eigsh → вложение размерности dimension.
+
+    Принимает sparse csr_matrix.
+    Возвращает np.ndarray shape (n, dimension), float32, l2-нормированный.
     """
+    if not hasattr(K, "toarray"):
+        K = csr_matrix(K)
+
     n = K.shape[0]
     dimension = min(dimension, n - 2)
 
-    d = K.sum(axis=1)
+    d = np.asarray(K.sum(axis=1)).ravel()
     d_inv_sqrt = np.where(d > 0, 1.0 / np.sqrt(d), 0.0)
-    # Нормализованный Лапласиан: L_sym = D^{-1/2} K D^{-1/2}
-    L_sym = d_inv_sqrt[:, None] * K * d_inv_sqrt[None, :]
-
-    # Разреженный формат для эффективности
-    L_sparse = csr_matrix(L_sym)
+    D_inv_sqrt = diags(d_inv_sqrt)
+    L_sym      = D_inv_sqrt @ K @ D_inv_sqrt
 
     try:
-        eigenvalues, eigenvectors = eigsh(L_sparse, k=dimension + 1, which="LM")
+        eigenvalues, eigenvectors = eigsh(
+            L_sym, k=dimension + 1, which="LM",
+            maxiter=1000, tol=1e-4,
+        )
     except Exception as exc:
-        logger.warning("eigsh failed: %s, falling back to eigh", exc)
-        eigenvalues, eigenvectors = np.linalg.eigh(L_sym)
-        eigenvalues = eigenvalues[-dimension-1:]
-        eigenvectors = eigenvectors[:, -dimension-1:]
+        k_fb = min(16, n - 2)
+        logger.warning("[scKTLD] eigsh failed (%s), fallback k=%d", exc, k_fb)
+        eigenvalues, eigenvectors = eigsh(
+            L_sym, k=k_fb + 1, which="LM", tol=1e-3,
+        )
 
-    # Сортируем по убыванию
-    idx = np.argsort(eigenvalues)[::-1]
-    eigenvectors = eigenvectors[:, idx[1:dimension+1]]  # пропускаем тривиальный
-
-    embedding = normalize(eigenvectors, norm="l2")
-    return embedding.astype(np.float32)
+    idx         = np.argsort(eigenvalues)[::-1]
+    eigenvectors = eigenvectors[:, idx[1: dimension + 1]]
+    return normalize(eigenvectors, norm="l2").astype(np.float32)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Сегментация через DP
+# 3. DP-сегментация (cumsum, O(n²))
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _segment_cost(embedding: np.ndarray, i: int, j: int) -> float:
-    """
-    Стоимость сегмента [i, j] — среднее квадратичное отклонение внутри.
-    """
-    if j <= i:
-        return 0.0
-    seg = embedding[i:j+1]
-    centroid = seg.mean(axis=0)
-    return float(np.sum((seg - centroid) ** 2))
-
-
-def _dynamic_programming_segmentation(
+def _dp_segmentation_fast(
     embedding: np.ndarray,
     penalty: float,
     min_size: int = 3,
 ) -> list[int]:
     """
-    Оптимальная сегментация через DP (PELT-like, упрощённая).
-    Возвращает список индексов границ (включая 0 и n).
+    Оптимальная сегментация через DP с cumsum-ускорением.
+
+    Возвращает список правых границ сегментов (в бинах, не включая 0),
+    последний элемент всегда == n:
+        [b1, b2, ..., n]
+    Сегменты: [0, b1), [b1, b2), ..., [b_{k-1}, n)
     """
     n = embedding.shape[0]
-    # dp[i] = минимальная стоимость сегментации [0, i)
+    E   = embedding.astype(np.float64)
+    # Cumsum для cost(a,b) без явного Python-цикла внутри cost()
+    cs  = np.zeros((n + 1, E.shape[1]))
+    cs2 = np.zeros(n + 1)
+    cs[1:]  = np.cumsum(E, axis=0)
+    cs2[1:] = np.cumsum(np.sum(E ** 2, axis=1))
+
+    def cost(a: int, b: int) -> float:
+        """Внутрисегментная дисперсия × length для [a, b)."""
+        length = b - a
+        if length <= 0:
+            return 0.0
+        seg_sum = cs[b] - cs[a]
+        seg_sq  = cs2[b] - cs2[a]
+        return float(seg_sq - np.dot(seg_sum, seg_sum) / length)
+
     dp   = np.full(n + 1, np.inf)
     prev = np.full(n + 1, -1, dtype=int)
     dp[0] = 0.0
 
-    # Кэш стоимостей для ускорения
-    cost_cache: dict[tuple[int, int], float] = {}
-
-    def cost(a: int, b: int) -> float:
-        if (a, b) not in cost_cache:
-            cost_cache[(a, b)] = _segment_cost(embedding, a, b - 1)
-        return cost_cache[(a, b)]
-
-    for j in range(1, n + 1):
-        for i in range(max(0, j - n), j - min_size + 1):
-            if dp[i] + cost(i, j) + penalty < dp[j]:
-                dp[j] = dp[i] + cost(i, j) + penalty
+    for j in range(min_size, n + 1):
+        i_max = j - min_size + 1
+        for i in range(0, i_max):
+            if dp[i] == np.inf:
+                continue
+            c = dp[i] + cost(i, j) + penalty
+            if c < dp[j]:
+                dp[j] = c
                 prev[j] = i
 
     # Трассировка
-    boundaries = []
+    boundaries: list[int] = []
     pos = n
     while pos > 0:
         boundaries.append(pos)
         pos = prev[pos]
     boundaries.reverse()
-    return boundaries
+    return boundaries  # [b1, b2, ..., n]
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. Автоподбор penalty
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _auto_penalty(
     embedding: np.ndarray,
     penalty_grid: Optional[list[float]] = None,
     min_size: int = 3,
+    min_tads: int = _AUTO_MIN_TADS,
+    max_tads: int = _AUTO_MAX_TADS,
 ) -> float:
     """
-    Автоподбор penalty: выбирается значение, при котором число TAD
-    стабилизируется (минимальное изменение при увеличении penalty).
+    Автоподбор penalty по логарифмической сетке.
+
+    Стратегия:
+    1. Просчитать число TAD для каждого penalty в сетке.
+    2. Оставить только penalty с min_tads ≤ count ≤ max_tads (valid zone).
+    3. Среди валидных найти elbow (максимальное |Δcount|).
+    4. Если valid zone пуста — выбрать penalty, ближайшую к середине
+       диапазона [min_tads, max_tads].
+
+    Parameters
+    ----------
+    embedding    : спектральное вложение (n, d)
+    penalty_grid : список значений penalty (None → авто)
+    min_size     : минимальный размер TAD в бинах
+    min_tads     : нижняя граница допустимого числа TAD
+    max_tads     : верхняя граница допустимого числа TAD
+
+    Returns
+    -------
+    float : выбранный penalty
     """
+    n = embedding.shape[0]
+
     if penalty_grid is None:
-        n = embedding.shape[0]
-        # Логарифмическая сетка
+        # Сетка: от "много TAD" до "мало TAD"
+        # Нижняя граница — penalty даёт ~max_tads TAD
+        # Верхняя граница — penalty даёт ~min_tads TAD
+        # Эмпирически: cost одного бина ≈ trace(cov(embedding))
+        typical_cost = float(np.trace(np.cov(embedding.T))) if n > 2 else 1.0
+        p_lo = max(typical_cost * 0.05, n * 0.001)
+        p_hi = typical_cost * 20.0
         penalty_grid = list(np.logspace(
-            np.log10(max(0.01, n * 0.001)),
-            np.log10(n * 2.0),
-            num=15,
+            np.log10(p_lo),
+            np.log10(max(p_hi, p_lo * 10)),
+            num=20,
         ))
 
+    # ── Шаг 1: просчёт ────────────────────────────────────────────────────
     counts: list[tuple[float, int]] = []
     for p in penalty_grid:
-        bnd = _dynamic_programming_segmentation(embedding, p, min_size)
-        n_domains = len(bnd) - 1
-        counts.append((p, n_domains))
-        logger.debug("  penalty=%.3f → %d TADs", p, n_domains)
+        bnd     = _dp_segmentation_fast(embedding, p, min_size)
+        n_tads  = max(0, len(bnd) - 1)
+        counts.append((p, n_tads))
+        logger.debug("[scKTLD] auto_penalty  p=%.4f → %d TADs", p, n_tads)
 
-    # Elbow: наибольшее изменение наклона
-    n_counts = np.array([c[1] for c in counts], dtype=float)
-    diffs = np.abs(np.diff(n_counts))
-    # Выбираем точку после крутого падения
-    elbow_idx = int(np.argmax(diffs)) + 1
-    best_p = counts[elbow_idx][0]
-    logger.info("auto_penalty: выбрано %.4f (elbow @ idx=%d, TADs=%d)",
-                best_p, elbow_idx, counts[elbow_idx][1])
+    penalties  = np.array([c[0] for c in counts])
+    n_tads_arr = np.array([c[1] for c in counts], dtype=float)
+
+    # ── Шаг 2: valid zone ─────────────────────────────────────────────────
+    valid_mask = (n_tads_arr >= min_tads) & (n_tads_arr <= max_tads)
+    valid_idx  = np.where(valid_mask)[0]
+
+    if len(valid_idx) == 0:
+        # Нет ни одного penalty в допустимом диапазоне →
+        # выбираем ближайший к target_tads (середина диапазона)
+        target = (min_tads + max_tads) / 2.0
+        closest = int(np.argmin(np.abs(n_tads_arr - target)))
+        best_p  = float(penalties[closest])
+        logger.warning(
+            "[scKTLD] auto_penalty: valid zone пуста (min=%d max=%d), "
+            "выбран ближайший к target=%.0f: p=%.4f → %d TADs",
+            min_tads, max_tads, target, best_p, int(n_tads_arr[closest]),
+        )
+        return best_p
+
+    # ── Шаг 3: elbow среди валидных ───────────────────────────────────────
+    valid_penalties = penalties[valid_idx]
+    valid_counts    = n_tads_arr[valid_idx]
+
+    if len(valid_idx) == 1:
+        best_p = float(valid_penalties[0])
+        logger.info(
+            "[scKTLD] auto_penalty: единственный валидный p=%.4f → %d TADs",
+            best_p, int(valid_counts[0]),
+        )
+        return best_p
+
+    # Elbow = индекс максимального абсолютного перепада
+    diffs     = np.abs(np.diff(valid_counts))
+    elbow_pos = int(np.argmax(diffs)) + 1   # +1: elbow после перепада
+
+    # Берём точку ПОСЛЕ elbow (где count стабилизировался)
+    elbow_pos = min(elbow_pos, len(valid_idx) - 1)
+    best_p    = float(valid_penalties[elbow_pos])
+
+    logger.info(
+        "[scKTLD] auto_penalty: выбрано p=%.4f (elbow_pos=%d, TADs=%d) "
+        "[valid zone: %d–%d TADs, %d точек]",
+        best_p, elbow_pos, int(valid_counts[elbow_pos]),
+        int(valid_counts.min()), int(valid_counts.max()), len(valid_idx),
+    )
     return best_p
 
 
@@ -195,7 +303,7 @@ def run_scktld(
     resolution: int,
     data_path: str,
     cfg: Optional[dict] = None,
-    dimension: int = 128,
+    dimension: int = _DEFAULT_DIMENSION,
     penalty: Optional[float] = None,
     matrix: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
@@ -204,84 +312,110 @@ def run_scktld(
 
     Parameters
     ----------
-    chrom      : хромосома
-    resolution : разрешение в bp
-    data_path  : путь к директории processed
-    cfg        : конфиг-словарь
-    dimension  : размерность спектрального вложения
-    penalty    : штраф DP (None → автоподбор)
-    matrix     : можно передать напрямую (RAW, без нормализации)
+    chrom      : хромосома ('chr17', ...)
+    resolution : разрешение в bp (25000, 50000, 100000)
+    data_path  : путь к директории data/processed/
+    cfg        : конфиг-словарь (None → использовать значения по умолчанию)
+    dimension  : размерность спектрального вложения (из cfg → 32)
+    penalty    : штраф DP (None → _auto_penalty)
+    matrix     : RAW-матрица (None → загружается через get_matrix)
 
     Returns
     -------
-    pd.DataFrame с колонками chrom, start, end
+    pd.DataFrame с колонками ['chrom', 'start', 'end']
+    При ошибке / пропуске — пустой DataFrame.
     """
-    # Проверка ограничений памяти
+    _empty = pd.DataFrame(columns=["chrom", "start", "end"])
+
+    # ── Параметры из конфига ───────────────────────────────────────────────
+    knn_k     = _DEFAULT_KNN_K
+    min_tads  = _AUTO_MIN_TADS
+    max_tads  = _AUTO_MAX_TADS
+
     if cfg is not None:
+        # Проверка ограничений памяти
         limits = cfg["chromosomes"]["scktld_limits"].get(resolution, [])
         if limits and chrom not in limits:
             logger.warning(
-                "[scKTLD] %s @ %d bp пропущена (ограничение памяти, разрешены: %s)",
+                "[scKTLD] %s @ %d bp пропущена (ограничение памяти). "
+                "Разрешены: %s",
                 chrom, resolution, limits,
             )
-            return pd.DataFrame(columns=["chrom", "start", "end"])
-        dimension = cfg["algorithms"]["scktld"]["dimension"]
+            return _empty
 
-    # Загрузить матрицу (RAW, balance=False)
-    if matrix is None:
-        if cfg is not None:
-            matrix = get_matrix(cfg, chrom, resolution)
-        else:
-            import os
-            npy = os.path.join(data_path, f"{chrom}_{resolution}bp.npy")
-            if not os.path.exists(npy):
-                raise FileNotFoundError(f"Матрица не найдена: {npy}")
-            matrix = np.load(npy)
+        algo_cfg  = cfg["algorithms"]["scktld"]
+        dimension = algo_cfg.get("dimension", dimension)
+        knn_k     = algo_cfg.get("knn_k",     knn_k)
 
-    matrix = matrix.astype(np.float64)
-    n = matrix.shape[0]
-    logger.info("[scKTLD] %s @ %d bp  | n_bins=%d dim=%d", chrom, resolution, n, dimension)
+    try:
+        # ── Загрузка матрицы (RAW, balance=False) ─────────────────────────
+        if matrix is None:
+            if cfg is not None:
+                matrix = get_matrix(cfg, chrom, resolution)
+            else:
+                import os
+                npy = os.path.join(data_path, f"{chrom}_{resolution}bp.npy")
+                if not os.path.exists(npy):
+                    raise FileNotFoundError(f"Матрица не найдена: {npy}")
+                matrix = np.load(npy)
 
-    if n < 10:
-        logger.warning("[scKTLD] Слишком мало бинов (%d) для %s", n, chrom)
-        return pd.DataFrame(columns=["chrom", "start", "end"])
+        matrix = np.nan_to_num(matrix.astype(np.float64), nan=0.0, posinf=0.0)
+        n      = matrix.shape[0]
 
-    # 1. RBF-ядро
-    K = _rbf_kernel_matrix(matrix)
+        logger.info(
+            "[scKTLD] %s @ %d bp | n_bins=%d dim=%d knn_k=%d",
+            chrom, resolution, n, dimension, knn_k,
+        )
 
-    # 2. Спектральное вложение
-    embedding = _spectral_embedding(K, dimension)
+        if n < 10:
+            logger.warning("[scKTLD] Слишком мало бинов (%d) для %s", n, chrom)
+            return _empty
 
-    # 3. Penalty
-    if penalty is None:
-        penalty = _auto_penalty(embedding)
+        # ── 1. RBF-ядро ───────────────────────────────────────────────────
+        K = _rbf_kernel_matrix(matrix, knn_k=knn_k)
 
-    # 4. Сегментация
-    boundaries = _dynamic_programming_segmentation(
-        embedding, penalty, min_size=max(3, resolution // 50000 + 1)
-    )
+        # ── 2. Спектральное вложение ───────────────────────────────────────
+        embedding = _spectral_embedding(K, dimension)
 
-    # 5. Формирование доменов
-    records = []
-    for k in range(len(boundaries) - 1):
-        start = boundaries[k - 1] * resolution if k > 0 else 0
-        # Исправленная трассировка: используем сами значения из boundaries
-        # как правые края сегментов
-        pass
+        # ── 3. Penalty ────────────────────────────────────────────────────
+        min_size = max(3, 100_000 // resolution)   # минимум ~100 kb в бинах
+        if penalty is None:
+            penalty = _auto_penalty(
+                embedding,
+                min_size=min_size,
+                min_tads=min_tads,
+                max_tads=max_tads,
+            )
 
-    # Корректная трассировка из DP
-    records = []
-    prev_end = 0
-    for bnd in boundaries[1:]:  # первый элемент = n (полная длина)
-        end = bnd * resolution
-        if end > prev_end:
-            records.append((chrom, prev_end, end))
-        prev_end = end
+        # ── 4. Сегментация ────────────────────────────────────────────────
+        boundaries = _dp_segmentation_fast(embedding, penalty, min_size=min_size)
 
-    if not records:
-        return pd.DataFrame(columns=["chrom", "start", "end"])
+        # ── 5. Формирование доменов ───────────────────────────────────────
+        # boundaries = [b1, b2, ..., n]  — правые края сегментов (в бинах)
+        # Сегмент k: [prev_bin, bnd_bin) в бинах → [prev_bin*res, bnd_bin*res) в bp
+        records: list[tuple[str, int, int]] = []
+        prev_bin = 0
+        for bnd_bin in boundaries:
+            start_bp = prev_bin  * resolution
+            end_bp   = bnd_bin   * resolution
+            if end_bp > start_bp:
+                records.append((chrom, start_bp, end_bp))
+            prev_bin = bnd_bin
 
-    df = pd.DataFrame(records, columns=["chrom", "start", "end"])
-    df = df[df["end"] > df["start"]].reset_index(drop=True)
-    logger.info("[scKTLD] Итого %d TAD", len(df))
-    return df
+        if not records:
+            logger.warning("[scKTLD] Нет доменов после сегментации (%s)", chrom)
+            return _empty
+
+        df = (
+            pd.DataFrame(records, columns=["chrom", "start", "end"])
+            .query("end > start")
+            .reset_index(drop=True)
+        )
+        logger.info("[scKTLD] Итого %d TAD  (%s @ %d bp)", len(df), chrom, resolution)
+        return df
+
+    except Exception as exc:
+        logger.error(
+            "[scKTLD] Ошибка %s @ %d: %s", chrom, resolution, exc, exc_info=True,
+        )
+        return _empty

@@ -1,0 +1,65 @@
+# ─── Данные ───────────────────────────────────────────────
+data/raw/
+data/processed/
+data/reference/
+*.hic
+*.cool
+*.mcool
+*.RAWobserved
+*.RAWexpected
+*.NORMobserved
+*.NORMexpected
+*.KRnorm
+*.KRexpected
+*.VCnorm
+*.VCexpected
+*.SQRTVC*
+
+# ─── Результаты ───────────────────────────────────────────
+results/
+
+# ─── Бинарники tools ──────────────────────────────────────
+tools/armatus/armatus
+tools/armatus/*.o
+tools/armatus/build/
+
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+
+# ─── Jupyter ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── Логи и временные файлы ───────────────────────────────
+*.log
+*.tmp
+*.temp
+*.bak
+
+# ─── Окружения ────────────────────────────────────────────
+.env
+.venv/
+env/
+venv/
+ENV/
+*.env
+
+# ─── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDE ──────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

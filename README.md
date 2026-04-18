@@ -103,7 +103,7 @@ data/reference/
 
 RAWobserved-файлы можно извлечь автоматически:
 ```bash
-python pipeline/run_pipeline.py --prep-data --resolution 25kb
+python pipeline/run_pipeline.py --prep-data --resolution 25000
 ```
 
 ---
@@ -113,19 +113,19 @@ python pipeline/run_pipeline.py --prep-data --resolution 25kb
 ```bash
 # Полный пайплайн на chr17-chr22, разрешение 25kb
 python pipeline/run_pipeline.py \
-    --resolution 25kb \
+    --resolution 25000 \
     --chroms chr17 chr18 chr19 chr20 chr21 chr22 \
     --algorithms armatus topdom scktld coitad
 
 # Только детекция + консенсус, без отчёта
 python pipeline/run_pipeline.py \
-    --resolution 100kb --chroms chr1 chr2 \
+    --resolution 100000 --chroms chr1 chr2 \
     --algorithms armatus topdom coitad \
     --skip-report
 
 # Только визуализация (TAD-листы уже есть)
 python pipeline/run_pipeline.py \
-    --resolution 50kb --chroms chr21 \
+    --resolution 50000 --chroms chr21 \
     --only-viz
 ```
 
@@ -141,4 +141,11 @@ results/
 │                  # rao_comparison.csv, ctcf_enrichment.csv
 ├── figures/       # hic_tads_<chrom>_<resolution>.png
 └── report.html    # сводный интерактивный отчёт
+```
+
+## Обновление правил проекта
+```bash
+python scripts/update_rules.py check        # проверить
+python scripts/update_rules.py add-algorithm <Name>  # новый алгоритм
+python scripts/update_rules.py changelog    # зафиксировать изменения
 ```

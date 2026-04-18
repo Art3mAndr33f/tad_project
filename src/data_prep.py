@@ -191,46 +191,78 @@ def prepare_all_matrices(
                 logger.error("Ошибка при извлечении %s @ %d: %s", chrom, res, exc)
 
 
-def get_matrix(
-    cfg: dict,
-    chrom: str,
-    resolution: int,
-    allow_extract: bool = True,
-) -> np.ndarray:
-    """
-    Загрузить матрицу из кэша (.npy) или извлечь из .hic если нет.
-    """
+def get_matrix(cfg, chrom, resolution, allow_extract=True):
     out_dir  = Path(cfg["paths"]["processed"])
     npy_path = out_dir / f"{chrom}_{resolution}bp.npy"
+    raw_path = out_dir / f"{chrom}_{resolution}bp.RAWobserved"
 
+    # 1. Кэш .npy
     if npy_path.exists():
+        logger.debug("Загрузка из кэша: %s", npy_path)
         return np.load(npy_path)
 
-    if allow_extract:
-        logger.warning("Кэш не найден, извлекаю из .hic: %s @ %d", chrom, resolution)
-        _ensure_dir(out_dir)
-        matrix = extract_dense_matrix(
-            cfg["paths"]["hic_file"], chrom, resolution, "NONE"
-        )
-        np.save(npy_path, matrix)
-        raw_path = out_dir / f"{chrom}_{resolution}bp.RAWobserved"
-        save_rawobserved(matrix, raw_path, resolution)
-        return matrix
+    if not allow_extract:
+        raise FileNotFoundError(f"Кэш не найден: {npy_path}")
 
-    raise FileNotFoundError(f"Матрица не найдена: {npy_path}")
+    # 2. Кэш RAWobserved в processed/
+    if raw_path.exists():
+        logger.info("Загрузка из processed RAWobserved: %s", raw_path)
+        matrix = load_rawobserved(raw_path, resolution)
 
+    # 3. RAWobserved прямо из data/raw/ (без .hic)
+    else:
+        raw_src = get_rawobserved_path_raw(cfg, chrom, resolution)
+        if raw_src.exists():
+            logger.warning("Кэш не найден, читаю из data/raw/: %s", raw_src)
+            matrix = load_rawobserved(raw_src, resolution)
+        # 4. Fallback — .hic (если вдруг появится)
+        else:
+            hic_path = cfg["paths"].get("hic_file", "")
+            if not hic_path or not Path(hic_path).exists():
+                raise FileNotFoundError(
+                    f"Нет ни кэша, ни RAWobserved, ни .hic для {chrom} @ {resolution}"
+                )
+            logger.warning("Кэш не найден, извлекаю из .hic: %s @ %d", chrom, resolution)
+            matrix = extract_dense_matrix(hic_path, chrom, resolution, normalization="NONE")
+
+    # Сохраняем кэш
+    _ensure_dir(out_dir)
+    np.save(npy_path, matrix)
+    save_rawobserved(matrix, raw_path, resolution)   # ← добавить эту строку
+    logger.info("Кэш сохранён: %s", npy_path)
+    return matrix
 
 def get_rawobserved_path(cfg: dict, chrom: str, resolution: int) -> Path:
-    """Вернуть путь к RAWobserved-файлу, извлечь при необходимости."""
     out_dir  = Path(cfg["paths"]["processed"])
     raw_path = out_dir / f"{chrom}_{resolution}bp.RAWobserved"
 
     if not raw_path.exists():
-        # Попробуем сначала data/raw/
-        alt = Path(cfg["paths"]["raw_data"]) / f"{chrom}_{resolution // 1000}kb.RAWobserved"
+        # ✅ правильный путь через get_rawobserved_path_raw
+        alt = get_rawobserved_path_raw(cfg, chrom, resolution)
         if alt.exists():
             return alt
-        # Извлекаем из .hic
+        # Fallback — извлечь через get_matrix (сохранит и .npy и .RAWobserved)
         get_matrix(cfg, chrom, resolution, allow_extract=True)
 
     return raw_path
+
+def _res_label(resolution: int) -> str:
+    """25000 → '25kb'"""
+    return f"{resolution // 1000}kb"
+
+
+def get_rawobserved_path_raw(cfg: dict, chrom: str, resolution: int) -> Path:
+    """
+    Путь к RAWobserved прямо в data/raw/ (без кэша processed/).
+    data/raw/GM12878_primary/25kb_resolution_intrachromosomal/chr17/MAPQGE30/chr17_25kb.RAWobserved
+    """
+    label = _res_label(resolution)
+    chrom_id = _chrom_strip(chrom)   # '17'
+    return (
+        Path(cfg["paths"]["raw_data"])
+        / "GM12878_primary"
+        / f"{label}_resolution_intrachromosomal"
+        / chrom
+        / "MAPQGE30"
+        / f"{chrom}_{label}.RAWobserved"
+    )

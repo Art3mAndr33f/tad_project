@@ -35,10 +35,11 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-# ── Убеждаемся что src/ в PYTHONPATH ───────────────────────────────────────
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
+# Добавляем корень проекта в sys.path,
+# чтобы работали импорты вида `from src.algorithms import ...`
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
@@ -102,7 +103,7 @@ def run_detection(
     Запустить все алгоритмы и вернуть словарь результатов.
     {algo: {chrom: {resolution: DataFrame}}}
     """
-    from algorithms import ALGORITHM_REGISTRY
+    from src.algorithms import ALGORITHM_REGISTRY
     logger = logging.getLogger("run_detection")
 
     results: dict = defaultdict(lambda: defaultdict(dict))

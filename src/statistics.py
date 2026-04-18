@@ -22,6 +22,24 @@ from scipy import stats as scipy_stats
 
 logger = logging.getLogger(__name__)
 
+_arrowhead_cache: dict[str, Optional[pd.DataFrame]] = {}
+_arrowhead_warned: set[str] = set()
+
+def _load_arrowhead_cached(path: str) -> Optional[pd.DataFrame]:
+    """Загрузить Arrowhead с кэшированием и однократным предупреждением."""
+    if path in _arrowhead_cache:
+        return _arrowhead_cache[path]
+    try:
+        df = pd.read_csv(path, sep="\t", comment="#",
+                         names=["chrom1","x1","x2","chrom2","y1","y2"])
+        _arrowhead_cache[path] = df
+        return df
+    except FileNotFoundError:
+        if path not in _arrowhead_warned:
+            logger.warning("Не удалось загрузить Arrowhead: %s", path)
+            _arrowhead_warned.add(path)
+        _arrowhead_cache[path] = None
+        return None
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Размеры хромосом hg19
