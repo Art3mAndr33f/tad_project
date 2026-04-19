@@ -147,5 +147,3 @@ python scripts/update_rules.py check        # проверить
 python scripts/update_rules.py add-algorithm <Name>  # новый алгоритм
 python scripts/update_rules.py changelog    # зафиксировать изменения
 ```
-=======
->>>>>>> e516dc2480df2b5d9bd89745443958a8bcb5fb74
