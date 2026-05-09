@@ -30,6 +30,29 @@ from sklearn.preprocessing import normalize
 
 from src.data_prep import get_matrix
 
+# ──────────────────────────────────────────────────────────────────────────────
+# GPU-детектирование (P2: GPU-адаптация для сервера)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_device() -> str:
+    """Определить устройство: 'cuda' если доступно, иначе 'cpu'."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # print т.к. вызывается до настройки logging (module-level)
+            print(f"[scKTLD] GPU: {torch.cuda.get_device_name(0)}")
+            return "cuda"
+    except Exception:
+        pass
+    print("[scKTLD] CPU режим")
+    return "cpu"
+
+DEVICE = _get_device()
+
+# Порог: n < 5000 бинов → плотная матрица ~100 MB, безопасно для GPU
+# chr17-chr22 @ 25kb: ~1900–3250 бинов → всегда GPU-путь
+_GPU_DENSE_THRESHOLD = 5000
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -97,10 +120,12 @@ def _rbf_kernel_matrix(
 
 def _spectral_embedding(K: csr_matrix, dimension: int) -> np.ndarray:
     """
-    Нормализованный Лапласиан → eigsh → вложение размерности dimension.
+    Нормализованный Лапласиан → eigendecomposition → вложение.
 
-    Принимает sparse csr_matrix.
-    Возвращает np.ndarray shape (n, dimension), float32, l2-нормированный.
+    Ветки:
+      GPU (n < 5000): torch.linalg.eigh на CUDA (~100 MB плотная матрица)
+      GPU (n >= 5000): fallback на CPU eigsh (слишком много памяти)
+      CPU: scipy eigsh (текущая реализация)
     """
     if not hasattr(K, "toarray"):
         K = csr_matrix(K)
@@ -108,11 +133,49 @@ def _spectral_embedding(K: csr_matrix, dimension: int) -> np.ndarray:
     n = K.shape[0]
     dimension = min(dimension, n - 2)
 
+    # Нормализованный Лапласиан (общий для всех веток)
     d = np.asarray(K.sum(axis=1)).ravel()
     d_inv_sqrt = np.where(d > 0, 1.0 / np.sqrt(d), 0.0)
     D_inv_sqrt = diags(d_inv_sqrt)
-    L_sym      = D_inv_sqrt @ K @ D_inv_sqrt
+    L_sym = D_inv_sqrt @ K @ D_inv_sqrt
 
+    # ── GPU-ветка ─────────────────────────────────────────────────────────────
+    if DEVICE == "cuda" and n < _GPU_DENSE_THRESHOLD:
+        try:
+            import torch
+            # Плотная матрица: n=3248 → ~42 MB float32 на GPU
+            L_dense = torch.tensor(
+                L_sym.toarray(), dtype=torch.float32, device="cuda"
+            )
+            # eigh возвращает eigenvalues в порядке возрастания
+            eigenvalues, eigenvectors = torch.linalg.eigh(L_dense)
+
+            # Берём dimension наибольших (последние в возрастающем порядке)
+            # Пропускаем последний (наибольший = 1 для нормализованного L)
+            total = eigenvectors.shape[1]
+            idx_start = max(0, total - dimension - 1)
+            idx_end   = total - 1                        # исключаем наибольший
+            vecs = eigenvectors[:, idx_start:idx_end]    # (n, dimension)
+
+            # Перевернуть: хотим убывающий порядок eigenvalues
+            vecs = torch.flip(vecs, dims=[1])
+
+            result = vecs.cpu().numpy().astype(np.float32)
+            del L_dense, eigenvalues, eigenvectors, vecs
+            torch.cuda.empty_cache()
+
+            logger.info(
+                "[scKTLD] GPU eigh: n=%d, dim=%d", n, dimension
+            )
+            return normalize(result, norm="l2")
+
+        except Exception as exc:
+            logger.warning(
+                "[scKTLD] GPU eigh failed (%s), fallback → CPU eigsh", exc
+            )
+            # fallthrough к CPU-ветке
+
+    # ── CPU-ветка (sparse eigsh) ──────────────────────────────────────────────
     try:
         eigenvalues, eigenvectors = eigsh(
             L_sym, k=dimension + 1, which="LM",
@@ -125,10 +188,10 @@ def _spectral_embedding(K: csr_matrix, dimension: int) -> np.ndarray:
             L_sym, k=k_fb + 1, which="LM", tol=1e-3,
         )
 
-    idx         = np.argsort(eigenvalues)[::-1]
+    idx          = np.argsort(eigenvalues)[::-1]
     eigenvectors = eigenvectors[:, idx[1: dimension + 1]]
+    logger.info("[scKTLD] CPU eigsh: n=%d, dim=%d", n, dimension)
     return normalize(eigenvectors, norm="l2").astype(np.float32)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. DP-сегментация (cumsum, O(n²))

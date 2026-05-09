@@ -182,15 +182,32 @@ pytest-cov>=4.1
 ### 4.2 Внешние инструменты
 
 - **Armatus**: C++-бинарник в `tools/armatus/armatus`.
-  Сборка через CMake (не Make):
-    sudo apt-get install libboost-dev libboost-program-options-dev \
-                         libboost-iostreams-dev zlib1g-dev
-    mkdir build && cd build
-    cmake .. -DCMAKE_EXE_LINKER_FLAGS="-lboost_iostreams -lz"
-    make -j$(nproc)
-  Бинарник: `build/src/armatus`
-- **coiTAD**: кастомная Python-версия в `tools/coiTAD/`.
-  Импортируется динамически через `sys.path`.
+
+  **Структура в git**: только `.gitkeep` (сам бинарник и `build/` в `.gitignore`)
+
+    **Сборка без sudo (через conda, CMake 4.x):**
+  ```bash
+  conda install -c conda-forge boost boost-cpp cmake make zlib -y
+
+  cd tools/armatus
+  git clone https://github.com/kingsfordgroup/armatus.git .
+  mkdir -p build && cd build
+
+  cmake .. \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+      -DCMAKE_C_COMPILER="${CONDA_PREFIX}/bin/gcc" \
+      -DCMAKE_CXX_COMPILER="${CONDA_PREFIX}/bin/g++" \
+      -DCMAKE_EXE_LINKER_FLAGS="-L${CONDA_PREFIX}/lib -Wl,-rpath,${CONDA_PREFIX}/lib -lboost_iostreams -lz" \
+      -DBOOST_ROOT="${CONDA_PREFIX}" \
+      -DBOOST_INCLUDEDIR="${CONDA_PREFIX}/include" \
+      -DBOOST_LIBRARYDIR="${CONDA_PREFIX}/lib" \
+      -DCMAKE_PREFIX_PATH="${CONDA_PREFIX}" \
+      -DBoost_NO_SYSTEM_PATHS=ON \
+      -DCMAKE_BUILD_TYPE=Release
+
+  make -j2   # ← не j$(nproc): правило сервера — не нагружать CPU
+  cp src/armatus ../../armatus
+  chmod +x ../../armatus
 
 ---
 
@@ -217,21 +234,18 @@ def run_<algorithm>(
 
 - Вызов через `subprocess.run()`
 - Флаги: -S (sparse 3-column TSV), -N (без нормализации), -c <chrom>
-- Флаг -R — для директории Rao, НЕ использовать
-- Флаг -z — не существует, НЕ использовать
-- Флаг -j — меняет логику на "только gamma_max", НЕ использовать при переборе gamma
-
-- Выходной файл: <prefix>.consensus.txt  (не .txt и не _level_0.txt)
-candidates = [
-    f"{prefix}.consensus.txt",   # ← первый приоритет
-    f"{prefix}.txt",
-    f"{prefix}_level_0.txt",
-    f"{prefix}_domain.txt",
-]
-- Перебор gamma: `[0.1, 0.5, 1.0, 2.0, 5.0]`
-- Выбор лучшей gamma: наибольшая средняя стабильность
-  (средний Jaccard на уровне доменов со всеми остальными gamma)
-- Парсинг выхода: файл `<prefix>.txt` или `<prefix>_level_0.txt`
+- Флаги -R, -z, -j — НЕ использовать (см. §17)
+- Выходной файл: `<prefix>.consensus.txt` (первый приоритет)
+- Перебор gamma: `[0.1, 0.3, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0, 2.0]`
+- Выбор лучшей gamma: **valid zone + stability**
+  1. Вычислить n_tads и средний Jaccard для каждой gamma
+  2. Valid zone: `chrom_mb × 0.8 ≤ n_tads ≤ chrom_mb × 2.5`
+     (эмпирическая плотность TAD ~0.8–2.5 TAD/Mb, GM12878 @ 25kb)
+  3. Среди валидных — выбрать gamma с max(stability)
+  4. Если valid zone пуста — выбрать ближайший к `target = (min+max)/2`
+- Переменные в `run_armatus`: результаты хранятся в `results` (не `gamma_results`)
+- `stability_top_n` читается из `cfg["algorithms"]["armatus"]["stability_top_n"]`
+- Формат лога gamma: `%.2f` (не `%.1f` — иначе 0.65 и 0.7 неотличимы)
 - Timeout: 600 секунд на один запуск
 
 ### 5.3 TopDom (`src/algorithms/run_topdom.py`)
@@ -247,13 +261,22 @@ candidates = [
 
 - **КРИТИЧНО**: принимает dense numpy n×n матрицу **без нормализации**
   (RAW counts, `balance=False`) — требование авторов алгоритма
-- Алгоритм: RBF-ядро → нормализованный Лапласиан → eigsh →
+- Алгоритм: RBF-ядро → нормализованный Лапласиан → eigendecomposition →
   спектральное вложение → DP-сегментация
 - `dimension=32`
 - `knn_k=20`
 - `penalty`: автоподбор через elbow на логарифмической сетке
 - **Перед запуском**: обязательная проверка `scktld_limits[resolution]`
 - При нарушении лимита — возвращать пустой DataFrame, НЕ падать
+- **GPU-детектирование**: `DEVICE = _get_device()` на уровне модуля
+  (использует `print`, не `logger` — вызывается до инициализации logging)
+- **`_GPU_DENSE_THRESHOLD = 5000`**: n < 5000 бинов → GPU-ветка
+  (chr17–chr22 @ 25kb: 1900–3250 бинов → всегда GPU)
+- **`_spectral_embedding` ветки**:
+  - GPU (n < 5000): `torch.linalg.eigh` на CUDA, плотная матрица ~100 MB
+  - GPU (n ≥ 5000): fallback на CPU `eigsh` (OOM риск)
+  - CPU: `scipy.sparse.linalg.eigsh` (текущая реализация без GPU)
+- **torch**: установлен через `pip install torch --index-url https://download.pytorch.org/whl/cu121`
 
 ### 5.5 coiTAD (`src/algorithms/run_coitad.py`)
 
@@ -262,9 +285,23 @@ candidates = [
   1. `CoiTADDetector().detect(matrix, resolution=resolution)`
   2. `detect_tads(matrix, resolution=resolution)`
   3. `run(matrix, resolution=resolution)`
-- **Fallback**: если `tools/coiTAD/` недоступен → встроенная реализация
-  на основе OI-матрицы + Directional Index
-- Авторские модификации из `tools/coiTAD/` — СОХРАНЯТЬ
+- **Fallback**: Insulation Score (Crane et al. 2015) если `tools/coiTAD/` недоступен
+
+#### Параметры fallback (откалиброваны на GM12878 @ 25kb):
+| Параметр | Значение | Обоснование |
+|----------|----------|-------------|
+| `window_bins` | `max(5, 125_000 // resolution)` | 5 бинов @ 25kb = 125kb |
+| `sigma` | 1.5 | умеренное сглаживание insulation score |
+| `prominence_factor` | 0.20 | порог глубины минимума = mean - 0.20×std |
+| `min_tad_kb` | 100 | минимальный размер TAD |
+
+#### Адаптивная логика fallback:
+- Если получено < 10 TAD → ослабить sigma на -0.5, prominence × 0.3
+- Если получено > 200 TAD → ужесточить sigma на +1.0, prominence × 1.5
+
+#### Ожидаемый результат:
+- 30–80 TAD на хромосому при 25kb
+- median_size_kb: 500–2000 kb
 
 ### 5.6 ALGORITHM_REGISTRY (`src/algorithms/__init__.py`)
 
@@ -410,8 +447,18 @@ chromosomes:
 
 algorithms:
   armatus:
-    gamma_values:    [0.1, 0.5, 1.0, 2.0, 5.0]
+    # Расширенная сетка для покрытия переходной зоны при 25kb
+    gamma_values: [0.1, 0.3, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0, 2.0]
     stability_top_n: 3
+    # Плотность TAD для valid zone (TAD/Mb):
+    tad_density_min: 0.8
+    tad_density_max: 2.5
+  coitad:
+    default_params:
+      window_bins: null     # null = auto (max(5, 125000 // resolution))
+      sigma: 1.5
+      prominence_factor: 0.20
+      min_tad_kb: 100
   topdom:
     window_sizes: [3, 5, 10]
     default_window: 5
@@ -420,8 +467,6 @@ algorithms:
     knn_k: 20
     balance: false
     auto_penalty: true
-  coitad:
-    default_params: {}
 
 consensus:
   tolerance_bins: 1
@@ -446,7 +491,7 @@ visualization:
   dpi:           300
   format:        "png"
   figsize:       [18, 14]
-  generate_html: true
+  generate_html: false  # отключено: Plotly рендер chr1@25kb занимает 39+ мин
   algorithm_colors:
     armatus: "#1f77b4"
     topdom:  "#ff7f0e"
@@ -733,6 +778,7 @@ HG19_CHROM_SIZES = {
 ### Что генерируется для каждой хромосомы × разрешение
 
 1. **PNG** (`hic_tads_<chrom>_<res>bp.png`, 300 dpi):
+   - ⚠️ `plt.Polygon`: использовать `facecolor=` + `edgecolor=` (не `color=` — вызывает дубль kwargs)
    - Hi-C карта: log1p(count), colormap=`coolwarm`
    - TAD-домены: цветные треугольники (4 строки = 4 алгоритма)
    - Консенсусные границы: вертикальные линии с цветом по схеме
@@ -795,6 +841,15 @@ ALGO_COLORS = {
 | coiTAD 300–700 TADs | `tools/coiTAD/` отсутствует, fallback пересегментирует | Исправить fallback или создать tools/coiTAD/ |
 | Arrowhead / CTCF не найдены | `data/reference/` пуста | Скачать отдельно (не входит в основной архив) |
 | `No module named 'src.visualization'` | `src/visualization.py` не создан | Создать файл |
+| `gamma_results` NameError | опечатка в имени переменной | использовать `results` (dict объявлен как `results: dict[...]`) |
+| `logger` NameError в `_get_device()` | функция вызывается на уровне модуля до `logger = logging.getLogger(__name__)` | использовать `print()` внутри `_get_device()` |
+| HTML-визуализация висит часами | Plotly рендерит матрицу chr1@25kb (~9970 бинов) | установить `generate_html: false` в config.yaml |
+| `... chrX` в --chroms | `...` воспринимается буквально как имя хромосомы | перечислять хромосомы явно: `chr1 chr2 chr3 ... chr22 chrX` |
+| stability_top_n NameError | не читается из cfg | добавить `stability_top_n = cfg[...].get("stability_top_n", 3)` в тело `run_armatus` |
+| coiTAD 2–11 TADs | prominence=0.60 слишком строго | использовать 0.20 + window=125kb |
+| coiTAD нет CTCF-пика | TADs слишком крупные (>3Mb) | исправить prominence_factor |
+| Нагрузка CPU на сервере | скрипты используют numpy многопоток | `OMP_NUM_THREADS=2 MKL_NUM_THREADS=2` |
+| GPU не используется | нет CUDA_VISIBLE_DEVICES | установить перед запуском |
 
 ---
 
@@ -973,7 +1028,7 @@ algorithms:
 
 ## 19. Changelog
 
-### v1.2 — (дата следующего изменения)
+### v1.4 — (дата следующего изменения)
 
 > Шаблон для следующей записи. Скопировать, заполнить, удалить эту строку.
 
@@ -989,7 +1044,59 @@ algorithms:
 **Затронутые секции**: ...
 **Затронутые файлы**: ...
 
+### v1.3 — 2026-05-03
+
+**Добавлено**
+- `_get_device()` в run_scktld.py: print (не logger) т.к. module-level до logging
+- `DEVICE = _get_device()` — module-level константа
+- `_GPU_DENSE_THRESHOLD = 5000` — порог бинов для GPU-ветки
+- GPU-ветка `_spectral_embedding`: `torch.linalg.eigh` на CUDA (n < 5000)
+- torch установлен: `pip install torch --index-url .../cu121`
+- Секция 17: три новых подводных камня (logger в _get_device, HTML медленно, `...` в --chroms)
+
+**Изменено**
+- `_spectral_embedding`: CPU eigsh → GPU/CPU двухветочная реализация
+- `src/visualization.py` ~90: `color=` → `facecolor=`, убран дублирующийся `edgecolor=`
+- `config/config.yaml`: `generate_html: true` → `false`
+- Секции 5.4, 8, 15, 17, 20 обновлены
+
+**Результаты прогона**
+- chr1–chr22 + chrX @ 25kb / 50kb / 100kb: все TAD-листы готовы
+- scKTLD пропускает chr1–chr16 @ 25kb (лимит памяти) — штатно
+- Консенсус: 27–119 границ support≥2 на хромосому
+
+**Затронутые секции**: 5.4, 8, 15, 17, 20
+**Затронутые файлы**: `src/algorithms/run_scktld.py`, `src/visualization.py`, `config/config.yaml`, `rules.md`
+
 ---
+
+### v1.2 — 2026-04-14
+
+**Изменено**
+- Armatus `_select_best_gamma`: добавлен valid zone фильтр по числу TAD
+  (плотность 0.8–2.5 TAD/Mb × размер хромосомы в Mb)
+- Armatus gamma_values: [0.1, 0.5, 1.0, 2.0, 5.0] → [0.1, 0.3, 0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.9, 1.0, 2.0]
+- Armatus лог формат: %.1f → %.2f (0.65 и 0.70 были неотличимы)
+- Исправлен NameError: `gamma_results` → `results`, `stability_top_n` добавлен в scope
+- coiTAD fallback: prominence_factor 0.60→0.20, sigma 2.5→1.5, window 250kb→125kb
+- coiTAD адаптивное ослабление: factor×0.5→×0.3
+
+**Добавлено**
+- Секция 20: GPU-адаптация для сервера с правилами использования
+- `_HG19_CHROM_SIZES_MB` в run_armatus.py
+- `_TAD_DENSITY_MIN/MAX` константы
+- `_get_device()` утилита для детектирования GPU
+- `CUDA_VISIBLE_DEVICES` инструкции в README и rules.md
+- GPU-версия scKTLD через cupy/torch (src/algorithms/run_scktld.py)
+
+**Исправлено**
+- Arrowhead warning spam: 90+ одинаковых предупреждений → однократное
+
+**Затронутые секции**: 5.2, 5.5, 8, 17, 20 (новая)
+**Затронутые файлы**: `src/algorithms/run_armatus.py`, `src/algorithms/run_coitad.py`,
+  `src/algorithms/run_scktld.py`, `config/config.yaml`, `README.md`
+
+*Версия rules.md: 1.3 | Проект: TAD Consensus Pipeline | Геном: hg19 | Данные: GSE63525 GM12878*
 
 ### v1.1 — 2026-04-11
 
@@ -1030,4 +1137,70 @@ algorithms:
 
 ---
 
-*Версия rules.md: 1.1 | Проект: TAD Consensus Pipeline | Геном: hg19 | Данные: GSE63525 GM12878*
+## 20. GPU-адаптация (сервер)
+
+### 20.1 Правила сервера
+
+⚠️ **На сервере ЗАПРЕЩЕНО нагружать CPU.** Все вычислительно тяжёлые операции
+должны выполняться на GPU.
+
+```bash
+# Перед запуском — проверить свободный GPU:
+nvtop
+nvidia-smi
+
+# Запуск с явным GPU:
+CUDA_VISIBLE_DEVICES=0 python pipeline/run_pipeline.py ...
+```
+
+### 20.2 Какие части пайплайна используют GPU
+
+| Компонент | CPU (локально) | GPU (сервер) | Ускорение |
+|-----------|---------------|--------------|-----------|
+| scKTLD: RBF-ядро | numpy/scipy | cupy | ~10–30× |
+| scKTLD: eigsh | scipy.sparse.linalg | torch.lobpcg / cupy.sparse | ~5–20× |
+| scKTLD: DP | numpy | numpy (O(n²) — не критично) | — |
+| TopDom | numpy | numpy (быстро и так) | — |
+| Armatus | subprocess C++ | subprocess C++ (без GPU) | — |
+| coiTAD fallback | numpy/scipy | numpy (быстро и так) | — |
+
+### 20.3 Требования для GPU-режима
+
+```yaml
+# environment.yml — добавить:
+  - cupy-cuda12x>=13.0    # или cupy-cuda11x в зависимости от CUDA версии
+  - pytorch>=2.0          # для torch.linalg альтернативы
+```
+
+**Фактически установлено на brain-lab (CUDA 13.0, Driver 580.82.07):**
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Проверка: CUDA available: True | GPU 0: NVIDIA A100 80GB PCIe | Free: ~62 GB
+```
+
+### 20.4 Детектирование GPU в коде
+
+```python
+# Каноническая проверка — использовать везде где нужен GPU
+def _get_device():
+    """Определить устройство: 'cuda' если доступно, иначе 'cpu'."""
+    try:
+        import cupy as cp
+        cp.cuda.runtime.getDeviceCount()   # проверка без создания массива
+        return "cuda"
+    except Exception:
+        return "cpu"
+
+DEVICE = _get_device()
+```
+
+### 20.5 Переменные окружения
+
+```bash
+# Обязательно перед запуском пайплайна на сервере:
+export CUDA_VISIBLE_DEVICES=0   # или 1 — выбрать свободный GPU
+export OMP_NUM_THREADS=2        # ограничить CPU-потоки
+export MKL_NUM_THREADS=2
+```
+
+*Версия rules.md: 1.3 | Проект: TAD Consensus Pipeline | Геном: hg19 | Данные: GSE63525 GM12878*

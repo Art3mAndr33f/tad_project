@@ -229,7 +229,7 @@ def _coitad_fallback(
         boundaries = _find_boundaries(
             score,
             min_size=min_size,
-            sigma=sigma + 1.5,
+            sigma=sigma + 1.0,
             prominence_factor=prominence_factor * 1.5,
         )
 

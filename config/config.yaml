@@ -60,7 +60,11 @@ algorithms:
     auto_penalty: true
 
   coitad:
-    default_params: {}          # параметры читаются из tools/coiTAD/config
+    default_params:
+      window_bins: null        # null = auto: max(5, 125000 // resolution)
+      sigma: 1.5               # сглаживание insulation score
+      prominence_factor: 0.20  # порог глубины минимума (было 0.60 → 2-11 TADs)
+      min_tad_kb: 100          # минимальный размер TAD
 
 # ─── Консенсус ───────────────────────────────────────
 consensus:
@@ -89,7 +93,7 @@ visualization:
   dpi: 300
   format: "png"
   figsize: [18, 14]
-  generate_html: true           # plotly интерактивный
+  generate_html: false           # plotly интерактивный
   algorithm_colors:
     armatus: "#1f77b4"
     topdom:  "#ff7f0e"

@@ -18,10 +18,24 @@ data/reference/
 # ─── Результаты ───────────────────────────────────────────
 results/
 
+# ─── Бэкапы ───────────────────────────────────────────────
+*.bak
+*.partial
+
+# Архивы
+*.tar.gz
+*.gz
+
 # ─── Бинарники tools ──────────────────────────────────────
-tools/armatus/armatus
+tools/armatus/armatus      # бинарник — НЕ в git
 tools/armatus/*.o
 tools/armatus/build/
+tools/armatus/src/         # исходники armatus — НЕ в git (клонируются отдельно)
+
+# Структура tools/ СОХРАНЯЕТСЯ в git через .gitkeep
+# tools/armatus/.gitkeep   ← в git
+# tools/coiTAD/.gitkeep    ← в git
+# tools/coiTAD/__init__.py ← в git
 
 # ─── Python ───────────────────────────────────────────────
 __pycache__/
@@ -63,3 +77,14 @@ desktop.ini
 .vscode/
 *.swp
 *.swo
+
+# Conda
+.conda/
+# Armatus: бинарник и сборка не в git (rules.md §4.2)
+tools/armatus/armatus
+tools/armatus/build/
+tools/armatus/binaries/
+tools/armatus/logo/
+# Исходники armatus — опционально: можно оставить если нет submodule
+# tools/armatus/src/
+# tools/armatus/include/

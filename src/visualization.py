@@ -87,7 +87,6 @@ def _draw_tad_triangles(
             edgecolor=color,
             alpha=alpha,
             linewidth=0.5,
-            edgecolor="black",
         )
         ax.add_patch(triangle)
 

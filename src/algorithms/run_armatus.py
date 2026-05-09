@@ -261,8 +261,11 @@ def run_armatus(
     pd.DataFrame с колонками chrom, start, end
     """
     if cfg is not None:
-        armatus_bin  = cfg["paths"]["armatus_bin"]
-        gamma_values = cfg["algorithms"]["armatus"]["gamma_values"]
+        armatus_bin     = cfg["paths"]["armatus_bin"]
+        gamma_values    = cfg["algorithms"]["armatus"]["gamma_values"]
+        stability_top_n = cfg["algorithms"]["armatus"].get("stability_top_n", 3) 
+    else:
+        stability_top_n = 3
 
     gamma_values = gamma_values or [0.1, 0.5, 1.0, 2.0, 5.0]
 
@@ -290,7 +293,7 @@ def run_armatus(
             results[gamma] = df
             logger.info("  gamma=%.2f → %d TADs", gamma, len(df))
 
-        best_gamma = _select_best_gamma(gamma_results, chrom=chrom, top_n=stability_top_n)
+        best_gamma = _select_best_gamma(results, chrom=chrom, top_n=stability_top_n)
 
     df_best = results[best_gamma].copy()
     df_best = df_best[df_best["start"] < df_best["end"]].reset_index(drop=True)
