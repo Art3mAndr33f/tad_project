@@ -34,10 +34,14 @@ logger = logging.getLogger(__name__)
 
 # Цвета алгоритмов
 ALGO_COLORS = {
-    "armatus": "#1f77b4",
-    "topdom":  "#ff7f0e",
-    "scktld":  "#2ca02c",
-    "coitad":  "#d62728",
+    "armatus":        "#1f77b4",   # синий
+    "topdom":         "#ff7f0e",   # оранжевый
+    "scktld":         "#2ca02c",   # зелёный
+    "coitad":         "#d62728",   # красный
+    # Новые:
+    "dihmm":          "#9467bd",   # фиолетовый
+    "ontad":          "#e377c2",   # розовый
+    "modularity_tad": "#17becf",   # циан
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

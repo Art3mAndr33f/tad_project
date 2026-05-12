@@ -21,6 +21,7 @@ paths:
   report:         "results/report.html"
   armatus_bin:    "tools/armatus/armatus"
   coitad_dir:     "tools/coiTAD"
+  ontad_bin:      "tools/ontad/OnTAD"
 
   hic_file:       "data/raw/GSE63525_GM12878_insitu_primary_30.hic"
   arrowhead_file: "data/reference/GSE63525_GM12878_primary+replicate_Arrowhead_domainlist.txt"
@@ -65,6 +66,25 @@ algorithms:
       sigma: 1.5               # сглаживание insulation score
       prominence_factor: 0.20  # порог глубины минимума (было 0.60 → 2-11 TADs)
       min_tad_kb: 100          # минимальный размер TAD
+  dihmm:
+    window_bins: 10        # окно DI (Dixon 2012 использует 2 Mb → ~80 бинов @25kb,
+                           # но 10 даёт лучший баланс signal/noise на GM12878)
+    n_states: 3            # HMM states: upstream / unbiased / downstream
+    n_iter: 100
+    min_tad_kb: 100.0
+
+  ontad:
+    penalty: 0.1           # штраф за дополнительные TAD
+    minsz: 3               # минимальный TAD в бинах
+    maxsz: 200             # максимальный TAD в бинах (200×25kb = 5Mb)
+    log2: true             # log2-преобразование входной матрицы
+    hic_norm: "NONE"       # RAW, без нормализации
+
+  modularity_tad:
+    max_dist_mb: 5.0       # максимальное расстояние для контактов
+    penalty: 0.05          # пенализация числа TAD в DP
+    min_tad_kb: 100.0
+    max_tad_kb: 5000.0
 
 # ─── Консенсус ───────────────────────────────────────
 consensus:
