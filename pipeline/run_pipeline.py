@@ -273,9 +273,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--algorithms", nargs="+",
-        default=["armatus", "topdom", "scktld", "coitad"],
-        choices=["armatus", "topdom", "scktld", "coitad"],
-        help="Алгоритмы для запуска",
+        default=None,                  # None → все из REGISTRY
+        help="Алгоритмы для запуска (default: все из ALGORITHM_REGISTRY)",
     )
     parser.add_argument(
         "--prep-data", action="store_true",
@@ -315,7 +314,7 @@ def main() -> None:
     logger = logging.getLogger("pipeline")
 
     logger.info("╔══════════════════════════════════════╗")
-    logger.info("║    TAD Consensus Pipeline  v1.0      ║")
+    logger.info("║    TAD Consensus Pipeline  v2.1      ║")
     logger.info("╚══════════════════════════════════════╝")
 
     # ── Конфигурация ────────────────────────────────────────────────────────
@@ -324,7 +323,13 @@ def main() -> None:
 
     resolutions = args.resolution or cfg["resolutions"]
     chromosomes = args.chroms    or cfg["chromosomes"]["all"]
-    algorithms  = args.algorithms
+    from src.algorithms import ALGORITHM_REGISTRY as _REG
+    _all_algos  = list(_REG.keys())
+    algorithms  = args.algorithms if args.algorithms is not None else _all_algos
+    unknown = [a for a in algorithms if a not in _REG]
+    if unknown:
+        logger.error("Unknown algorithms: %s. Available: %s", unknown, _all_algos)
+        sys.exit(1)
 
     logger.info("Разрешения: %s", [f"{r//1000}kb" for r in resolutions])
     logger.info("Хромосомы:  %s", chromosomes)

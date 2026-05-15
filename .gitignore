@@ -31,6 +31,7 @@ tools/armatus/armatus      # бинарник — НЕ в git
 tools/armatus/*.o
 tools/armatus/build/
 tools/armatus/src/         # исходники armatus — НЕ в git (клонируются отдельно)
+tools/ontad_src
 
 # Структура tools/ СОХРАНЯЕТСЯ в git через .gitkeep
 # tools/armatus/.gitkeep   ← в git
@@ -48,6 +49,7 @@ dist/
 build/
 .eggs/
 .pytest_cache/
+*.npy
 
 # ─── Jupyter ──────────────────────────────────────────────
 .ipynb_checkpoints/
@@ -80,11 +82,3 @@ desktop.ini
 
 # Conda
 .conda/
-# Armatus: бинарник и сборка не в git (rules.md §4.2)
-tools/armatus/armatus
-tools/armatus/build/
-tools/armatus/binaries/
-tools/armatus/logo/
-# Исходники armatus — опционально: можно оставить если нет submodule
-# tools/armatus/src/
-# tools/armatus/include/

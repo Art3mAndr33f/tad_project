@@ -1,20 +1,17 @@
-"""
-src/algorithms/run_modularity_tad.py
+# src/algorithms/run_modularity_tad.py
+"""ModularityTAD: DP-сегментация Hi-C на основе intra/inter-ratio score.
 
-TAD detection via Hi-C contact graph modularity maximization.
+score(i, j) = mean_OE_intra(i,j) − mean_OE_flanks(i,j)
 
-Метод: 1D-адаптация Newman modularity Q для Hi-C контактных матриц.
-  Q_tad(i,j) = mean_B(i,j) = mean[ A[a,b] - k[a]*k[b]/(2m) ]
-  для всех пар (a,b) внутри TAD [i,j) с |a-b| <= max_dist_bins.
+O/E нормализация (наблюдаемое / ожидаемое по диагонали) убирает
+distance-decay без bias в сторону малых или крупных TAD.
 
-Нормировка на число пар обеспечивает сравнимость score для TAD
-любого размера. Auto-penalty находит диапазон 1–2.5 TAD/Mb.
+v2.2: O/E нормализация вместо log1p.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -22,269 +19,322 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_DIST_MB = 5.0
-_DEFAULT_MIN_TAD_KB  = 100.0
-_DEFAULT_MAX_TAD_KB  = 3000.0   # уменьшили с 5000 → меньше гигантских TAD
-_SEED = 42
 
-# Сетка penalty от строгого к мягкому
-_PENALTY_GRID = [2.0, 1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005, 0.001]
+# ──────────────────────────────────────────────────────────────────────────────
+# O/E нормализация
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _oe_normalize(A: np.ndarray) -> np.ndarray:
+    """Observed / Expected нормализация по диагоналям.
+
+    Для каждого расстояния d: делим все контакты на среднее по диагонали d.
+    После нормировки среднее значение на каждой диагонали = 1.
+    Это полностью убирает distance-decay, не создавая bias ни к малым,
+    ни к крупным TAD.
+    """
+    n   = A.shape[0]
+    out = A.copy().astype(np.float64)
+
+    for d in range(n):
+        idx  = np.arange(n - d)
+        diag = A[idx, idx + d]
+
+        # Среднее только ненулевых контактов (нулевые = пропущенные данные)
+        nz   = diag[diag > 0]
+        mean_d = nz.mean() if nz.size > 0 else 0.0
+
+        if mean_d > 0:
+            out[idx,     idx + d] = diag / mean_d
+            if d > 0:
+                out[idx + d, idx    ] = A[idx + d, idx] / mean_d
+
+    return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+# 2D Prefix-суммы
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_prefix2d(A: np.ndarray) -> np.ndarray:
+    """P[i, j] = sum(A[0:i, 0:j]).  Размер (n+1)×(n+1)."""
+    n = A.shape[0]
+    P = np.zeros((n + 1, n + 1), dtype=np.float64)
+    P[1:, 1:] = np.cumsum(np.cumsum(A, axis=0), axis=1)
+    return P
+
+
+def _rect_sum(P: np.ndarray, r0: int, c0: int, r1: int, c1: int) -> float:
+    """Сумма A[r0:r1, c0:c1] через prefix-суммы."""
+    if r0 >= r1 or c0 >= c1:
+        return 0.0
+    return float(P[r1, c1] - P[r0, c1] - P[r1, c0] + P[r0, c0])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Score: OE-intra − OE-flanks
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _score_intra_minus_flanks(
+    P: np.ndarray,
+    i: int,
+    j: int,
+    n: int,
+) -> float:
+    """score(i,j) = mean_OE_intra(i,j) − mean_OE_flanks(i,j).
+
+    TAD = [i, j)  (0-based, полуоткрытый).
+    flanks: [max(0,i−size), i) × [i,j)  и  [i,j) × [j, min(n,j+size)).
+    """
+    size = j - i
+    if size <= 0:
+        return -np.inf
+
+    intra_sum  = _rect_sum(P, i, i, j, j)
+    intra_mean = intra_sum / (size * size)
+
+    lf_start = max(0, i - size)
+    rf_end   = min(n, j + size)
+
+    left_sum  = _rect_sum(P, lf_start, i, i, j)
+    right_sum = _rect_sum(P, i, j, j, rf_end)
+
+    left_n  = (i - lf_start) * size
+    right_n = size * (rf_end - j)
+    flank_n = left_n + right_n
+
+    flank_mean = (left_sum + right_sum) / flank_n if flank_n > 0 else 0.0
+
+    return intra_mean - flank_mean
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DP-сегментация
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _dp_segment(
+    score_matrix: np.ndarray,
+    penalty: float,
+    min_tad_bins: int,
+    max_tad_bins: int,
+    n: int,
+) -> list[tuple[int, int]]:
+    """DP: обязательное полное покрытие [0, n) TAD-сегментами.
+
+    Ключевые отличия от предыдущей версии:
+    - Нет pass-through: dp[j] недостижимо если нет валидного TAD [i,j).
+    - Нет merge-шага: каждый сегмент в backtrace — настоящий TAD.
+    - Если n не достижимо — принудительно расширяем последний TAD до n.
+
+    dp[j] = max суммарный score для полного покрытия [0, j).
+    back[j] = начало последнего TAD, заканчивающегося в j.
+    """
+    NEG_INF = -1e18
+    dp   = np.full(n + 1, NEG_INF, dtype=np.float64)
+    back = np.full(n + 1, -1,      dtype=np.int32)
+    dp[0] = 0.0
+
+    for j in range(min_tad_bins, n + 1):
+        i_lo = max(0, j - max_tad_bins)
+        i_hi = j - min_tad_bins          # включительно
+
+        for i in range(i_lo, i_hi + 1):
+            if dp[i] < NEG_INF / 2:
+                continue
+            s = float(score_matrix[i, j - 1])
+            if s <= NEG_INF / 2:         # невалидная ячейка
+                continue
+            val = dp[i] + s - penalty
+            if val > dp[j]:
+                dp[j]   = val
+                back[j] = i
+
+    # Если n недостижимо — расширить последний достижимый TAD до n
+    if dp[n] < NEG_INF / 2 or back[n] < 0:
+        # Найти ближайший достижимый j*, расширить [back[j*], n)
+        for j_last in range(n - 1, min_tad_bins - 1, -1):
+            if dp[j_last] > NEG_INF / 2 and back[j_last] >= 0:
+                back[n] = back[j_last]
+                dp[n]   = dp[j_last]    # score не пересчитываем
+                # Обрезать backtrace: j_last больше не финальная точка
+                # Перестроить: вместо (back[j_last], j_last) сделать (back[j_last], n)
+                # Достаточно просто выставить back[n] и оборвать цепочку на j_last
+                # путём установки back[j_last] в "занятое" значение
+                dp[j_last] = NEG_INF    # исключить j_last как конечную точку
+                break
+        else:
+            # Полный fallback: один TAD на весь хром
+            back[n] = 0
+            dp[n]   = float(score_matrix[0, n - 1]) - penalty
+
+    # Backtrace — только реальные TAD-сегменты
+    segments: list[tuple[int, int]] = []
+    j = n
+    while j > 0:
+        i = int(back[j])
+        if i < 0:
+            # Докрыть остаток одним сегментом
+            segments.append((0, j))
+            break
+        segments.append((i, j))
+        j = i
+        if j == 0:
+            break
+
+    segments.reverse()
+    return segments
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Auto-penalty sweep
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _auto_penalty_sweep(
+    score_matrix: np.ndarray,
+    min_tad_bins: int,
+    max_tad_bins: int,
+    n: int,
+    chrom_mb: float,
+) -> tuple[float, list[tuple[int, int]]]:
+    """Подобрать penalty: target 0.8–2.5 TAD/Mb.
+
+    После O/E нормализации score(хороший TAD) ≈ 0.3–1.5,
+    поэтому sweep идёт в диапазоне [0.01, 2.0].
+    """
+    target_lo  = max(5,   int(chrom_mb * 0.8))
+    target_hi  = min(200, int(chrom_mb * 2.5))
+    target_mid = (target_lo + target_hi) / 2.0
+
+    # Медиана положительных score как anchor
+    valid  = score_matrix[score_matrix > 0]
+    median = float(np.median(valid)) if valid.size > 0 else 1.0
+    logger.info("[modtad] O/E score stats: median=%.4f, max=%.4f",
+                median, float(score_matrix.max()))
+
+    # Абсолютные penalties (O/E score не зависит от данных, только от структуры)
+    penalties = [2.0, 1.5, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.15, 0.1,
+                 0.08, 0.05, 0.03, 0.01]
+
+    best_pen  = penalties[len(penalties) // 2]
+    best_segs: list[tuple[int, int]] = []
+    best_dist = np.inf
+
+    for pen in penalties:
+        segs = _dp_segment(score_matrix, pen, min_tad_bins, max_tad_bins, n)
+        n_t  = len(segs)
+        dist = abs(n_t - target_mid)
+        logger.info("[modtad] penalty=%.3f → %d TADs (target %d–%d)",
+                    pen, n_t, target_lo, target_hi)
+
+        if target_lo <= n_t <= target_hi:
+            logger.info("[modtad] ✓ penalty=%.3f hits target: %d TADs", pen, n_t)
+            return pen, segs
+
+        if dist < best_dist:
+            best_dist = dist
+            best_pen  = pen
+            best_segs = segs
+
+    logger.warning("[modtad] sweep done, best=%d TADs (target %d–%d)",
+                   len(best_segs), target_lo, target_hi)
+    return best_pen, best_segs
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Главная функция
+# ──────────────────────────────────────────────────────────────────────────────
+
 def run_modularity_tad(
     chrom: str,
     resolution: int,
     data_path: str,
-    cfg: Optional[dict],
+    cfg: Optional[dict] = None,
     **kwargs,
 ) -> pd.DataFrame:
-    empty = pd.DataFrame(columns=["chrom", "start", "end"])
+    """Запустить ModularityTAD для одной хромосомы."""
+    _empty = pd.DataFrame(columns=["chrom", "start", "end"])
 
-    # ── 1. Загрузить матрицу ─────────────────────────────────────────────────
+    algo_cfg = (cfg or {}).get("algorithms", {}).get("modularity_tad", {})
+
+    max_dist_mb  = float(algo_cfg.get("max_dist_mb",  5.0))
+    penalty_cfg  = algo_cfg.get("penalty", None)
+    min_tad_kb   = float(algo_cfg.get("min_tad_kb",  100.0))
+    max_tad_kb   = float(algo_cfg.get("max_tad_kb", 3000.0))
+
+    min_tad_bins  = max(2, int(min_tad_kb  * 1_000 / resolution))
+    max_tad_bins  = max(min_tad_bins + 1,
+                        int(max_tad_kb * 1_000 / resolution))
+    max_dist_bins = int(max_dist_mb * 1_000_000 / resolution)
+
+    # ── Загрузка матрицы ────────────────────────────────────────────────────
     try:
-        matrix = _load_matrix(data_path, chrom, resolution)
-    except FileNotFoundError as exc:
-        logger.error("[modtad] Матрица не найдена %s @ %d: %s", chrom, resolution, exc)
-        return empty
+        from src.data_prep import get_matrix  # type: ignore
+        matrix = get_matrix(cfg, chrom, resolution)
+    except Exception as exc:
+        logger.error("[modtad] get_matrix failed: %s", exc, exc_info=True)
+        return _empty
 
-    n = matrix.shape[0]
-    logger.info("[modtad] %s @ %d — матрица %d×%d загружена", chrom, resolution, n, n)
+    if matrix is None or matrix.size == 0:
+        logger.error("[modtad] Empty matrix for %s @ %d", chrom, resolution)
+        return _empty
 
-    if n < 10:
-        logger.warning("[modtad] %s @ %d — слишком мало бинов (%d)", chrom, resolution, n)
-        return empty
+    A = np.asarray(matrix, dtype=np.float64)
+    n = A.shape[0]
 
-    # ── 2. Параметры из конфига ──────────────────────────────────────────────
-    algo_cfg     = (cfg or {}).get("algorithms", {}).get("modularity_tad", {})
-    max_dist_mb  = float(algo_cfg.get("max_dist_mb", _DEFAULT_MAX_DIST_MB))
-    min_tad_kb   = float(algo_cfg.get("min_tad_kb",  _DEFAULT_MIN_TAD_KB))
-    max_tad_kb   = float(algo_cfg.get("max_tad_kb",  _DEFAULT_MAX_TAD_KB))
-    penalty_cfg  = algo_cfg.get("penalty", None)   # None = auto
+    # Маскировать дальние контакты
+    for d in range(max_dist_bins, n):
+        idx = np.arange(n - d)
+        A[idx, idx + d] = 0.0
+        A[idx + d, idx] = 0.0
 
-    max_dist_bins = max(5, int(max_dist_mb * 1e6 / resolution))
-    min_tad_bins  = max(2, int(min_tad_kb  * 1e3 / resolution))
-    max_tad_bins  = max(min_tad_bins + 1, int(max_tad_kb * 1e3 / resolution))
+    # Симметризация
+    A = (A + A.T) / 2.0
 
-    # Целевой диапазон: 1.0–2.5 TAD/Mb (эмпирика GM12878)
-    chrom_mb   = n * resolution / 1e6
-    target_min = max(5,  int(chrom_mb * 1.0))
-    target_max = max(10, int(chrom_mb * 2.5))
+    chrom_mb = n * resolution / 1_000_000
+    logger.info("[modtad] %s @ %d: %dx%d (%.1f Mb), min=%d max=%d bins",
+                chrom, resolution, n, n, chrom_mb, min_tad_bins, max_tad_bins)
 
-    logger.debug(
-        "[modtad] %s @ %d: n=%d, %.1f Mb, target=%d–%d TADs, "
-        "max_dist=%d bins, min_tad=%d bins, max_tad=%d bins",
-        chrom, resolution, n, chrom_mb, target_min, target_max,
-        max_dist_bins, min_tad_bins, max_tad_bins,
-    )
+    # ── O/E нормализация ────────────────────────────────────────────────────
+    # Убирает distance-decay без bias к размеру TAD.
+    # После нормировки среднее на каждой диагонали = 1.
+    A_oe = _oe_normalize(A)
 
-    # ── 3. Модулярная матрица B (полосовой формат) ───────────────────────────
-    B_band = _compute_B_band(matrix, max_dist_bins)
+    # ── Prefix-суммы и score-матрица ────────────────────────────────────────
+    P = _build_prefix2d(A_oe)
 
-    # ── 4. TAD-scores: нормированные prefix-суммы ────────────────────────────
-    score_compact = _compute_score_compact(B_band, n, max_dist_bins, max_tad_bins)
-
-    # ── 4b. Нормировка score → [0, 1] ────────────────────────────────────────
-    # Делим на максимальный score чтобы penalty_grid был независим от
-    # абсолютных значений матрицы (RAW counts сильно варьируют между хромосомами)
-    sc_max = float(np.max(score_compact))
-    if sc_max > 0:
-        score_compact = (score_compact / sc_max).astype(np.float32)
-        logger.debug("[modtad] Score нормирован на %.2f → диапазон [0, 1]", sc_max)
-
-    # ── Диагностика score-диапазона ──────────────────────────────────────────
-    nonzero_scores = score_compact[score_compact != 0]
-    if len(nonzero_scores):
-        logger.debug(
-            "[modtad] Score диапазон: min=%.4f median=%.4f max=%.4f",
-            float(np.min(nonzero_scores)),
-            float(np.median(nonzero_scores)),
-            float(np.max(nonzero_scores)),
-        )
-
-    # ── 5. Auto-penalty DP ───────────────────────────────────────────────────
-    penalties = [float(penalty_cfg)] if penalty_cfg is not None else _PENALTY_GRID
-
-    best_df  = empty
-    best_n   = 0
-    best_pen = penalties[0]
-
-    for pen in penalties:
-        boundaries = _dp_segment(score_compact, n, pen, min_tad_bins, max_tad_bins)
-        n_tads     = len(boundaries)
-        logger.debug("[modtad] penalty=%.4f → %d TADs", pen, n_tads)
-
-        if target_min <= n_tads <= target_max:
-            best_pen = pen
-            best_df  = _to_df(boundaries, chrom, resolution)
-            logger.info(
-                "[modtad] %s @ %d — penalty=%.4f → %d TADs ✓ (target %d–%d)",
-                chrom, resolution, pen, n_tads, target_min, target_max,
-            )
-            break
-
-        # Запомнить лучший пока не нашли в диапазоне
-        if target_min <= n_tads * 2 and n_tads > best_n:
-            best_n   = n_tads
-            best_pen = pen
-            best_df  = _to_df(boundaries, chrom, resolution)
-
-    if len(best_df) < 3:
-        logger.warning(
-            "[modtad] %s @ %d — не попали в target (%d–%d), "
-            "возвращаем %d TADs @ penalty=%.4f",
-            chrom, resolution, target_min, target_max,
-            len(best_df), best_pen,
-        )
-
-    logger.info("[modtad] %s @ %d — итого %d TADs", chrom, resolution, len(best_df))
-    return best_df
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Вспомогательные функции
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _load_matrix(data_path: str, chrom: str, resolution: int) -> np.ndarray:
-    npy = Path(data_path) / f"{chrom}_{resolution}bp.npy"
-    if not npy.exists():
-        raise FileNotFoundError(npy)
-    m = np.load(str(npy)).astype(np.float64)
-    m = np.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
-    return np.maximum(m, m.T)
-
-
-def _compute_B_band(matrix: np.ndarray, max_dist_bins: int) -> np.ndarray:
-    """
-    B_band[i, d] = A[i, i+d] - k[i]*k[i+d] / (2m)
-    где k[i] = локальная степень (сумма контактов до max_dist_bins).
-
-    shape: (n, max_dist_bins+1)
-    """
-    n = matrix.shape[0]
-
-    # Локальные степени
-    k = np.zeros(n, dtype=np.float64)
+    score_matrix = np.full((n, n), -np.inf, dtype=np.float32)
     for i in range(n):
-        lo = max(0, i - max_dist_bins)
-        hi = min(n, i + max_dist_bins + 1)
-        k[i] = matrix[i, lo:hi].sum() - matrix[i, i]
+        j_min = i + min_tad_bins
+        j_max = min(n, i + max_tad_bins)
+        for j in range(j_min, j_max + 1):
+            score_matrix[i, j - 1] = _score_intra_minus_flanks(P, i, j, n)
 
-    two_m = max(k.sum(), 1.0)
+    # ── DP + penalty ────────────────────────────────────────────────────────
+    if penalty_cfg is not None:
+        pen  = float(penalty_cfg)
+        segs = _dp_segment(score_matrix, pen, min_tad_bins, max_tad_bins, n)
+        logger.info("[modtad] fixed penalty=%.4f → %d TADs", pen, len(segs))
+    else:
+        pen, segs = _auto_penalty_sweep(
+            score_matrix, min_tad_bins, max_tad_bins, n, chrom_mb
+        )
 
-    # Полосовой лапласиан
-    B_band = np.zeros((n, max_dist_bins + 1), dtype=np.float64)
-    for d in range(1, max_dist_bins + 1):
-        diag    = np.diagonal(matrix, offset=d)   # shape (n-d,) — всегда правильно
-        B_band[:n - d, d] = diag - k[:n - d] * k[d:n] / two_m
+    if not segs:
+        logger.warning("[modtad] DP returned 0 segments for %s", chrom)
+        return _empty
 
-    return B_band
+    # ── Конвертация в bp ────────────────────────────────────────────────────
+    tads = []
+    for s_bin, e_bin in segs:
+        start_bp = s_bin * resolution
+        end_bp   = e_bin * resolution
+        if (end_bp - start_bp) / 1_000 >= min_tad_kb:
+            tads.append({"chrom": chrom, "start": start_bp, "end": end_bp})
 
+    if not tads:
+        logger.warning("[modtad] 0 TADs after bp-filter on %s", chrom)
+        return _empty
 
-def _compute_score_compact(
-    B_band: np.ndarray,
-    n: int,
-    max_dist_bins: int,
-    max_tad_bins: int,
-) -> np.ndarray:
-    """
-    score_compact[i, l] = mean B[a,b] для всех пар (a,b) с i<=a<b<i+l, b-a<=max_dist.
-    Нормировка на реальное число пар делает score сравнимым для TAD любого размера.
-    shape: (n, max_tad_bins+1), dtype float32
-    """
-    prefix = np.zeros((n + 1, max_dist_bins + 1), dtype=np.float64)
-    for d in range(1, max_dist_bins + 1):
-        prefix[1:, d] = np.cumsum(B_band[:, d])
-
-    score_compact = np.zeros((n, max_tad_bins + 1), dtype=np.float32)
-
-    for l in range(1, max_tad_bins + 1):
-        # n_pairs = число пар (a, a+d) с 0<=d<=min(l-1, max_dist): = Σ max(0, l-d)
-        n_pairs = sum(l - d for d in range(1, min(l, max_dist_bins) + 1))
-        if n_pairs == 0:
-            continue
-        norm  = float(n_pairs)
-        max_i = n - l
-        if max_i <= 0:
-            continue
-
-        i_arr = np.arange(max_i, dtype=np.int32)
-        total = np.zeros(max_i, dtype=np.float64)
-
-        for d in range(1, min(l, max_dist_bins) + 1):
-            # Пар с этой диагональю внутри [i, i+l): a ∈ [i, i+l-d)
-            # Вклад: prefix[i+l-d] - prefix[i]  (но не дальше n)
-            end_idx = np.minimum(i_arr + (l - d), n).astype(np.int32)
-            total  += prefix[end_idx, d] - prefix[i_arr, d]
-
-        score_compact[:max_i, l] = (total / norm).astype(np.float32)
-
-    return score_compact
-
-
-def _dp_segment(
-    score_compact: np.ndarray,
-    n: int,
-    penalty: float,
-    min_tad_bins: int,
-    max_tad_bins: int,
-) -> list[tuple[int, int]]:
-    """
-    DP: найти разбиение [0, n) максимизирующее sum(score) - penalty * n_tads.
-    """
-    dp     = np.full(n + 1, -1e18, dtype=np.float64)
-    parent = np.full(n + 1, -1,    dtype=np.int32)
-    dp[0]  = 0.0
-
-    sc_cols = score_compact.shape[1]
-
-    for j in range(min_tad_bins, n + 1):
-        i_min = max(0, j - max_tad_bins)
-        i_max = j - min_tad_bins + 1
-
-        i_arr = np.arange(i_min, i_max, dtype=np.int32)
-        l_arr = j - i_arr
-
-        valid = (l_arr >= min_tad_bins) & (l_arr <= max_tad_bins) & (l_arr < sc_cols)
-        i_arr = i_arr[valid]
-        l_arr = l_arr[valid]
-        if len(i_arr) == 0:
-            continue
-
-        dp_prev    = dp[i_arr]
-        reachable  = dp_prev > -1e17
-        if not reachable.any():
-            continue
-
-        q_vals     = score_compact[i_arr, l_arr].astype(np.float64)
-        candidates = np.where(reachable, dp_prev + q_vals - penalty, -1e18)
-
-        best = int(np.argmax(candidates))
-        if candidates[best] > dp[j]:
-            dp[j]     = candidates[best]
-            parent[j] = int(i_arr[best])
-
-    # Traceback
-    tads: list[tuple[int, int]] = []
-    pos = n
-    while pos > 0:
-        prev = int(parent[pos])
-        if prev < 0:
-            logger.warning("[modtad] DP traceback прерван на pos=%d", pos)
-            return [(0, n)]
-        tads.append((prev, pos))
-        pos = prev
-    tads.reverse()
-    return tads
-
-
-def _to_df(
-    boundaries: list[tuple[int, int]],
-    chrom: str,
-    resolution: int,
-) -> pd.DataFrame:
-    records = [
-        {"chrom": chrom, "start": s * resolution, "end": e * resolution}
-        for s, e in boundaries
-    ]
-    return pd.DataFrame(records, columns=["chrom", "start", "end"])
+    df_out = pd.DataFrame(tads, columns=["chrom", "start", "end"])
+    logger.info("[modtad] FINAL: %d TADs on %s @ %d, median=%.0fkb",
+                len(df_out), chrom, resolution,
+                (df_out.end - df_out.start).median() / 1000)
+    return df_out

@@ -82,7 +82,7 @@ algorithms:
 
   modularity_tad:
     max_dist_mb: 5.0       # максимальное расстояние для контактов
-    penalty: 0.05          # пенализация числа TAD в DP
+    penalty: null          # пенализация числа TAD в DP
     min_tad_kb: 100.0
     max_tad_kb: 5000.0
 
