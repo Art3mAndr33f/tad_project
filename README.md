@@ -435,6 +435,16 @@ pytest tests/ -v
 | GNN на консенсусных границах (proof-of-concept) | — |
 | Публикация размеченных Hi-C карт | — |
 
+### ✅ Завершено в v3.2
+
+| Результат |
+|-----------|
+| Полный прогон всех 7 алгоритмов @ 25/50/100kb (chr1–chr22) |
+| ModularityTAD: O/E нормализация, 42 TADs chr22 @ 25kb |
+| OnTAD: recursive subdivision, 26 TADs chr22 @ 25kb |
+| Pipeline CLI: поддержка всех 7 алгоритмов через `--algorithms` |
+| CTCF-валидация: ускорена в ~100x через numpy broadcasting |
+
 ---
 
 ## Известные проблемы
@@ -447,6 +457,9 @@ pytest tests/ -v
 | OnTAD: depth=1 → мало TADs | ✅ Исправлено v2.1 | `agent_docs/05_known_issues.md` |
 | ModularityTAD: 300+ TADs | ✅ Исправлено v2.1 | `agent_docs/05_known_issues.md` |
 | OnTAD: компиляция (uint64_t, libcurl) | ✅ Исправлено v2.0 | `agent_docs/04_build_ontad.md` |
+| coitad @ 100kb: 16 TADs, median 12Mb | ⚠️ Known issue | Исключить из консенсуса @ 100kb |
+| armatus @ 100kb: avg 202 TADs (завышено) | ⚠️ Known issue | Используется, но с оговоркой |
+| CTCF-валидация медленная (50kb+) | ✅ Исправлено v3.2 | Векторизация в `_count_ctcf_overlaps` |
 
 ---
 
