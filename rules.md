@@ -1,5 +1,5 @@
 # TAD Consensus Pipeline — Project Rules for LLM Context
-# Version: 3.1 | 2026-05-14 | Genome: hg19 | Data: GSE63525 GM12878
+# Version: 3.4 | 2026-05-20 | Genome: hg19 | Data: GSE63525 GM12878
 
 > **docs-first:** rules.md обновляется ДО изменения кода.
 > Кидай этот файл в начало любого нового чата — это единственный источник правды.
@@ -28,7 +28,7 @@
 4. Предлагает статистические методы (Фурье, спектр, TAD-overlap) — **новизна**
 
 **OS:** Ubuntu 22.04 | **Python:** 3.10+ | **Conda env:** `tad_pipeline`
-**GPU:** `CUDA_VISIBLE_DEVICES=3` (brain-lab, ~40 GB свободно на GPU 3)
+**GPU:** `CUDA_VISIBLE_DEVICES=2` (brain-lab, ~20 GB свободно)
 
 ---
 
@@ -50,9 +50,9 @@ pytest tests/ -v
 
 # Новый участник — контекст за 10 минут
 cat rules.md
-cat agent_docs/09_workstreams.md   # найди свой workstream
-cat agent_docs/<твой_файл>.md      # загрузи детали
-git checkout -b ws/<workstream>    # создай свою ветку
+cat agent_docs/09_workstreams.md
+cat agent_docs/<твой_файл>.md
+git checkout -b ws/<workstream>
 ```
 
 ---
@@ -61,12 +61,14 @@ git checkout -b ws/<workstream>    # создай свою ветку
 
 ```
 src/algorithms/          ← 7 детекторов TAD (единый интерфейс → §5)
-src/consensus.py         ← жадная кластеризация границ
+src/consensus.py         ← жадная кластеризация границ + TAD-консенсус (Jaccard)
 src/validation.py        ← CTCF ChIP-seq валидация (биол. ground truth)
+src/ctcf_analysis.py     ← профильный анализ ChIP-seq треков (параметризован)
 src/statistics.py        ← Jaccard, boundary overlap, сравнение с Arrowhead
 src/visualization.py     ← Hi-C heatmap, CTCF профили, Jaccard matrix
 src/data_prep.py         ← загрузка матриц (4-уровневый fallback)
 pipeline/run_pipeline.py ← оркестратор
+scripts/run_chipseq_validation.py ← валидация по RAD21/SMC3/H3K4me3/H3K27ac
 config/config.yaml       ← ВСЕ параметры (не хардкодить!)
 agent_docs/              ← подробная дока по темам (загружай только нужное)
 thesis/                  ← текст диплома (главы в Markdown/LaTeX)
@@ -97,7 +99,23 @@ logs/                    ← логи запусков (не в git)
 |----------|------|----------|
 | Hi-C матрицы | `data/raw/` | RAWobserved, GM12878 primary |
 | Arrowhead эталон | `data/reference/GSE63525_..._Arrowhead_domainlist.txt` | Rao 2014 |
-| CTCF ChIP-seq | `data/reference/GM12878_CTCF_peaks_hg19.bed` | ENCODE ENCFF796WRU, hg19 |
+| CTCF ChIP-seq | `data/reference/GM12878_CTCF_peaks_hg19.bed` | ENCODE ENCFF796WRU, 44 217 пиков |
+| RAD21 ChIP-seq | `data/reference/GM12878_RAD21_peaks_hg19.bed` | ENCODE ENCFF001VFE (narrowPeak), 23 947 пиков ✅ 2026-05-19 |
+| SMC3 ChIP-seq | `data/reference/GM12878_SMC3_peaks_hg19.bed` | ENCODE ENCFF001VFH (narrowPeak), 64 597 пиков ✅ 2026-05-19 |
+| H3K4me3 ChIP-seq | `data/reference/GM12878_H3K4me3_peaks_hg19.bed` | UCSC wgEncodeBroadHistone (broadPeak), 57 476 пиков ✅ 2026-05-19 |
+| H3K27ac ChIP-seq | `data/reference/GM12878_H3K27ac_peaks_hg19.bed` | UCSC wgEncodeBroadHistone (broadPeak), 56 069 пиков ✅ 2026-05-19 |
+
+**Пути ChIP-seq треков в config/config.yaml (секция paths):**
+```yaml
+ctcf_bed:            "data/reference/GM12878_CTCF_peaks_hg19.bed"
+rad21_bed:           "data/reference/GM12878_RAD21_peaks_hg19.bed"
+smc3_bed:            "data/reference/GM12878_SMC3_peaks_hg19.bed"
+h3k4me3_bed:         "data/reference/GM12878_H3K4me3_peaks_hg19.bed"
+h3k27ac_bed:         "data/reference/GM12878_H3K27ac_peaks_hg19.bed"
+hic_figures_out:     "results/figures/hic_maps"
+chipseq_figures_out: "results/figures/chipseq_profiles"
+arrowhead_ref:       "data/reference/GSE63525_GM12878_primary+replicate_Arrowhead_domainlist.txt"
+```
 
 **Разрешения:** `[25000, 50000, 100000]`
 **Хромосомы:** `chr1–chr22, chrX`
@@ -146,14 +164,6 @@ def run_<algorithm>(
 ### ALGORITHM_REGISTRY (`src/algorithms/__init__.py`)
 
 ```python
-from .run_armatus        import run_armatus
-from .run_topdom         import run_topdom
-from .run_scktld         import run_scktld
-from .run_coitad         import run_coitad
-from .run_dihmm          import run_dihmm
-from .run_ontad          import run_ontad
-from .run_modularity_tad import run_modularity_tad
-
 ALGORITHM_REGISTRY = {
     "armatus":        run_armatus,
     "topdom":         run_topdom,
@@ -172,43 +182,81 @@ ALGORITHM_REGISTRY = {
 **Алгоритм:** Собрать все границы (start/end) → округлить до бина →
 жадная кластеризация с `tolerance_bins=1` → support = число алгоритмов в кластере.
 
+**TAD-консенсус (Jaccard):** `compute_tad_consensus()` — Union-Find по парам TAD
+из разных алгоритмов с Jaccard ≥ jaccard_threshold. Интегрирован в
+`compute_all_consensus()`. Выход: `results/consensus/tad_consensus_{chrom}_{res}bp.bed`.
+
 ```yaml
 consensus:
   tolerance_bins: 1
   min_support: 2
+  jaccard_threshold: 0.5   # порог Jaccard для TAD-консенсуса
 ```
 
-**Цветовая схема (ФИКСИРОВАНА — не менять):**
+**Цветовая схема CONSENSUS_COLORS (расширена до 7 уровней — не менять):**
 
 | Support | Цвет | Hex |
 |---------|------|-----|
 | 2 | 🟡 Жёлтый | `#FFD700` |
 | 3 | 🟠 Оранжевый | `#FF8C00` |
-| ≥4 | 🟢 Зелёный | `#00C800` |
+| 4 | 🟢 Зелёный | `#00C800` |
+| 5 | 🌲 Тёмно-зелёный | `#008000` |
+| 6 | 🔵 Синий | `#0000CD` |
+| 7 | 🟣 Фиолетовый | `#8B008B` |
 
 ---
 
 ## 7. CTCF-валидация — КРИТИЧЕСКИ ВАЖНО
 
-**CTCF ChIP-seq — биологический ground truth.** Это не просто метрика.
-CTCF совместно с когезином формирует петли ДНК, заякоривающие границы TAD.
-Хороший детектор TAD ОБЯЗАН давать обогащение CTCF на границах.
-Если алгоритм даёт границы без пика CTCF → его разметка биологически нерелевантна
-→ такой консенсус не годится для обучения нейросети.
+**CTCF ChIP-seq — биологический ground truth.** CTCF совместно с когезином
+формирует петли ДНК, заякоривающие границы TAD. Хороший детектор TAD ОБЯЗАН
+давать обогащение CTCF на границах.
 
 **Текущий статус:** нет чёткого пика у 4 классических алгоритмов →
 **это центральный аргумент диплома**.
 
-**⚠️ ACTIVE ISSUE — диагностировать в первую очередь:**
-```bash
-head -5 data/reference/GM12878_CTCF_peaks_hg19.bed  # формат
-cut -f1 data/reference/GM12878_CTCF_peaks_hg19.bed | sort -u  # chr-prefix?
-# Ожидаем: chr1, chr2, ... — если без chr → fix в src/validation.py
-```
+### Статус биологических валидаций (chr1 @ 100kb)
 
-**Метрика успеха (для нового пайплайна):**
-Распределение смещений CTCF от границ → ближе к δ(0) (узкий высокий пик).
-Текущий консенсус → размытое распределение → плохой датасет.
+| Приоритет | Валидация | CSV | PNG |
+|-----------|-----------|-----|-----|
+| ✅ P1 | CTCF профиль ±500kb | `results/stats/ctcf_enrichment.csv` | ✅ `ctcf_profile_all_algos_chr1_*` |
+| ✅ P2 | RAD21 профиль | `results/stats/rad21_enrichment.csv` | ✅ `chipseq_profiles/rad21_profile_all_algos_chr1_100000bp.png` |
+| ✅ P2 | SMC3 профиль | `results/stats/smc3_enrichment.csv` | ✅ `chipseq_profiles/smc3_profile_all_algos_chr1_100000bp.png` |
+| ✅ P4 | H3K4me3 профиль | `results/stats/h3k4me3_enrichment.csv` | ✅ `chipseq_profiles/h3k4me3_profile_all_algos_chr1_100000bp.png` |
+| ✅ P4 | H3K27ac профиль | `results/stats/h3k27ac_enrichment.csv` | ✅ `chipseq_profiles/h3k27ac_profile_all_algos_chr1_100000bp.png` |
+| 🟡 P3 | TSS / housekeeping genes | — | — |
+| 🟢 P5 | Alu/SINE обогащение | — | — |
+
+**Сводная таблица:** `results/stats/chipseq_validation_summary.csv`
+
+### Ключевые результаты валидации (chr1 @ 100kb)
+
+**RAD21 / SMC3 (когезин — специфичный маркер петлевых якорей):**
+| Алгоритм | RAD21 | SMC3 |
+|----------|-------|------|
+| Arrowhead | STRONG (ctr=1.46) | STRONG (ctr=1.25) |
+| ontad | STRONG (ctr=1.42) | STRONG (ctr=1.19) |
+| modularity_tad | STRONG (ctr=1.31) | STRONG (ctr=1.10) |
+| dihmm | GOOD (ctr=1.03) | SHIFTED (+475kb) |
+| armatus | WEAK (ctr=1.15) | WEAK (ctr=1.04) |
+| scktld | WEAK (ctr=1.02) | WEAK (ctr=1.06) |
+| topdom | SHIFTED (+355kb) | SHIFTED (+355kb) |
+| coitad | NO_DATA (15 бнд) | NO_DATA (15 бнд) |
+
+**H3K4me3 / H3K27ac (активационные марки):**
+- Сигнал слабее RAD21/SMC3 — ожидаемо (энхансеры/промоторы внутри TAD, не на границах)
+- STRONG: только Arrowhead
+- GOOD: modularity_tad, armatus (H3K4me3)
+- topdom: SHIFTED +155–355kb на всех треках (систематический артефакт)
+
+### Скрипт валидации
+`scripts/run_chipseq_validation.py` — переиспользует `run_ctcf_profile_analysis()`
+из `src/ctcf_analysis.py`. Параметр `ctcf_df` принимает любой ChIP-seq трек.
+
+### Ключевые функции src/validation.py
+- `compute_ctcf_profile(df, chipseq_df, chrom, resolution, ...)` → `(bins, density)`
+- `compute_ctcf_enrichment(...)` → статистика обогащения
+- ⚠️ `plot_ctcf_profile` **НЕ СУЩЕСТВУЕТ** — строить фигуры через matplotlib напрямую
 
 **Подробности → `agent_docs/03_ctcf_validation.md`**
 
@@ -233,13 +281,6 @@ cfg = load_config("config/config.yaml")
 rng = np.random.default_rng(42)
 Path(out).parent.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger(__name__)
-
-# ✅ При ошибке алгоритма
-try:
-    df = run_algorithm(...)
-except Exception as exc:
-    logger.error("[algo] %s @ %d: %s", chrom, resolution, exc, exc_info=True)
-    df = pd.DataFrame(columns=["chrom", "start", "end"])
 ```
 
 **Цвета алгоритмов (ФИКСИРОВАНЫ):**
@@ -260,11 +301,13 @@ ALGO_COLORS = {
 ## 9. Соглашения по именованию
 
 ```
-results/tads/<algo>_<chrom>_<res>bp.bed          # TAD-лист
-results/consensus/consensus_<chrom>_<res>bp.bed  # консенсус
-results/stats/<name>.csv                         # метрики
-results/figures/hic_tads_<chrom>_<res>bp.png     # фигуры
-data/processed/<chrom>_<res>bp.npy               # матрица
+results/tads/<algo>_<chrom>_<res>bp.bed                    # TAD-лист
+results/consensus/consensus_<chrom>_<res>bp.bed            # консенсус (границы)
+results/consensus/tad_consensus_<chrom>_<res>bp.bed        # консенсус (домены, Jaccard)
+results/stats/<name>.csv                                   # метрики
+results/figures/hic_maps/hic_browser_<chrom>_<res>bp.png      # Hi-C browser-style
+results/figures/hic_maps/hic_distance_<chrom>_<res>bp.png     # Hi-C distance-style
+results/figures/chipseq_profiles/<track>_profile_all_algos_<chrom>_<res>bp.png  # ChIP-seq профили
 
 chrom = "chr17"    # всегда с префиксом chr
 resolution = 25000 # в bp (int)
@@ -275,17 +318,12 @@ df.columns == ["chrom", "start", "end"]  # строго
 
 ## 10. Параллельная работа — Workstreams
 
-Проект разбит на **изолированные workstreams** с чёткими границами:
-
 | Workstream | Ветка | Зона ответственности |
 |------------|-------|----------------------|
 | WS-1: Algorithms | `ws/algorithms` | `src/algorithms/`, `tools/` |
 | WS-2: Visualization | `ws/visualization` | `src/visualization.py`, `results/figures/` |
-| WS-3: Validation | `ws/validation` | `src/validation.py`, `src/statistics.py`, `src/consensus.py` |
+| WS-3: Validation | `ws/validation` | `src/validation.py`, `src/ctcf_analysis.py`, `src/consensus.py` |
 | WS-4: Thesis | `ws/thesis` | `thesis/`, `notebooks/` |
-
-**Читают ВСЕ (только чтение):** `config/config.yaml`, `data/`, `src/data_prep.py`
-**Меняют по договорённости:** интерфейсы между WS (API-контракты)
 
 **Подробности → `agent_docs/09_workstreams.md`**
 
@@ -293,65 +331,48 @@ df.columns == ["chrom", "start", "end"]  # строго
 
 ## 11. Research Backlog
 
-> Полная документация по задачам → соответствующие `agent_docs/` файлы.
+### 🔴 P0 — Критично
 
-### 🔴 P0 — Критично (блокирует основной результат)
+- [x] ~~CTCF как ground truth: диагностика~~ ✅ v3.2
+- [x] ~~Широкий CTCF-профиль ±500kb~~ ✅ v3.2
+- [x] ~~compute_tad_consensus() — Jaccard ≥ 0.5~~ ✅ v3.3
 
-- [ ] **CTCF как ground truth:** Подтвердить биологическую информированность.
-  Диагностировать отсутствие пика (координаты, chr-prefix, ширина окна).
-  → `agent_docs/03_ctcf_validation.md`
+### 🟡 P1 — Важно
 
-- [ ] **Широкий CTCF-профиль ±500kb:** Заменить текущий ±1bin на профиль
-  плотности CTCF в окне ±500kb с binning 10kb. Показать на одном графике
-  все алгоритмы + Arrowhead эталон.
-  → `agent_docs/07_visualization.md` §P1
+- [x] ~~**PNG-фигуры профилей ChIP-seq (RAD21/SMC3/H3K4me3/H3K27ac)** ✅ v3.4~~
+  В `results/figures/chipseq_profiles/`
 
-- [ ] **Воспроизвести результаты алгоритмов из оригинальных статей:**
-  Armatus (Filippova 2014), TopDom (Shin 2016), OnTAD (An 2019),
-  scKTLD (Zheng 2024). Проверить на разных разрешениях.
-  → `agent_docs/01_algorithms.md`
+- [x] ~~**Изменить визуализацию Hi-C на visualization_sveta.py** ✅ v3.4~~
+  browser-style + distance-style. Jaccard удалён из pipeline.
 
-- [ ] **Гиперпараметры — обоснование:** Перепроверить, почему выбирается
-  конкретное число TAD для конкретной хромосомы. Правильно ли использовать
-  единый диапазон TAD/Mb для всех хромосом и разрешений?
-  → `agent_docs/01_algorithms.md` §OPEN QUESTIONS
+- [x] ~~**tad_consensus по всем хромосомам** ✅ v3.4~~
+  22 файла @ 100kb в `results/consensus/`. chr1: 142 домена.
 
-### 🟡 P1 — Важно (формирует основной аргумент)
+- [x] ~~**Прогон @ 50kb и 100kb, chr1–chr22** ✅ v3.4~~
+  TAD-файлы уже существовали; консенсус пересчитан напрямую.
+  ```bash
+  python pipeline/run_pipeline.py --resolution 50000 \
+      --chroms chr1 ... chr22 \
+      --algorithms armatus topdom scktld coitad dihmm ontad modularity_tad --force
+  ```
+  Исключения: coitad @ 100kb (unusable), scKTLD только chr17–chr22 @ 25kb.
 
-- [ ] **Наглядная визуализация границ:** Overlay алгоритмов и консенсуса
-  на Hi-C heatmap. Два режима: per_algo (tracks) и consensus (weighted lines).
-  Zoom на конкретные локусы.
-  → `agent_docs/07_visualization.md` §P2
+- [ ] **Наглядная overlay-визуализация границ:**
+  Overlay алгоритмов + консенсуса на Hi-C heatmap, zoom на локусы.
+  → `agent_docs/07_visualization.md`
 
-- [ ] **Консенсус по TAD, а не по границам:** Добавить поиск консенсусных
-  границ не по отдельным границам, а по пересечениям целых TAD.
-  Проверить реализацию в deepTAD.
-  → `agent_docs/10_statistical_methods.md` §Метод 3
+### 🟢 P2 — Развитие
 
-- [ ] **Биологическая валидация как ground truth:** Добавить проверку
-  консенсусных границ на CTCF. Показать, что текущий консенсус не проходит.
-  Ответить: можно ли использовать CTCF как единственный критерий датасета?
-  → `agent_docs/03_ctcf_validation.md` §P3
-
-- [ ] **Запустить прогон @ 50kb и 100kb:** Полный прогон chr1–chr22 для сбора
-  данных к главам 3 и 6 диплома.
-
-### 🟢 P2 — Развитие (основной научный вклад)
-
-- [ ] **Статистические методы поиска границ:** Фурье-анализ insulation score,
-  спектральные методы (Fiedler vector), change-point detection.
-  → `agent_docs/10_statistical_methods.md`
-
-- [ ] **Доказать превосходство нового датасета:** Количественно показать,
-  что новый пайплайн даёт более узкий/высокий пик в CTCF профиле vs консенсус.
-  → `agent_docs/03_ctcf_validation.md` §P2
-
-- [ ] **GNN на консенсусных границах:** Небольшая графовая нейросеть для
-  детекции TAD на полученных консенсусных границах как proof-of-concept.
-
-- [ ] **Написание диплома:** Начать с глав 3 (критика консенсуса) и 6
-  (результаты) — данные уже есть.
+- [ ] **Написание диплома — глава по биол. валидации:**
+  Интерпретировать ChIP-seq результаты. Ключевые тезисы:
+  ontad + modularity_tad STRONG по когезину; topdom систематич. смещение +355kb;
+  H3K4me3/H3K27ac слабее RAD21/SMC3 (ожидаемо).
   → `agent_docs/06_thesis_structure.md`
+
+- [ ] **TSS / housekeeping genes (P3):** GENCODE hg19 GTF
+- [ ] **Alu/SINE обогащение (P5):** UCSC RepeatMasker
+- [ ] **Статистические методы:** Фурье, спектр, change-point → `agent_docs/10_statistical_methods.md`
+- [ ] **GNN на консенсусных границах:** proof-of-concept
 
 ---
 
@@ -360,14 +381,14 @@ df.columns == ["chrom", "start", "end"]  # строго
 | # | Глава | Суть | Статус |
 |---|-------|------|--------|
 | 1 | Введение + мотивация | Hi-C, TAD, зачем нужен качественный датасет | 🔲 |
-| 2 | Обзор техник | 7 алгоритмов + deepTAD, метод сбора датасета | 🔲 |
-| 3 | Критика консенсуса | Почему deepTAD-style плохой (≥10 стр, много визуализаций) | 🔲 |
+| 2 | Обзор техник | 7 алгоритмов + deepTAD | 🔲 |
+| 3 | Критика консенсуса | Почему deepTAD-style плохой | 🔲 |
 | 4 | Механика алгоритмов | Почему разные алгоритмы → разные результаты | 🔲 |
 | 5 | Новый пайплайн | Статистические методы + CTCF-валидация | 🔲 |
-| 6 | Результаты | Новый датасет проходит CTCF-валидацию — main result | 🔲 |
-| 7 | Заключение | Вклад, публикация датасета, следующий шаг (нейросеть) | 🔲 |
+| 6 | Результаты | ChIP-seq валидация, сравнение алгоритмов | 🔲 |
+| 7 | Заключение | Вклад, публикация датасета | 🔲 |
 
-**Подробный план каждой главы → `agent_docs/06_thesis_structure.md`**
+**Подробный план → `agent_docs/06_thesis_structure.md`**
 
 ---
 
@@ -380,7 +401,7 @@ PyYAML>=6.0, tqdm>=4.66, jinja2>=3.1, click>=8.1
 hmmlearn>=0.3.3
 cooler>=0.9.3, pybedtools>=0.9.1, pyranges>=0.0.129
 pytest>=7.4, pytest-cov>=4.1
-torch (CUDA 12.1)  # pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch (CUDA 12.1)
 ```
 
 **Внешние бинарники:**
@@ -393,11 +414,13 @@ torch (CUDA 12.1)  # pip install torch --index-url https://download.pytorch.org/
 
 | Задача | Файл |
 |--------|------|
-| Добавить новый алгоритм | `src/algorithms/run_<new>.py` + `ALGORITHM_REGISTRY` + §5 этого файла |
+| Добавить новый алгоритм | `src/algorithms/run_<new>.py` + `ALGORITHM_REGISTRY` + §5 |
 | Изменить параметры | `config/config.yaml` |
-| Изменить консенсус | `src/consensus.py` |
+| Изменить консенсус границ | `src/consensus.py` |
+| Изменить TAD-консенсус (Jaccard) | `src/consensus.py::compute_tad_consensus()` |
 | Добавить метрику | `src/statistics.py` |
-| Изменить CTCF-анализ | `src/validation.py` |
+| Изменить CTCF/ChIP-seq анализ | `src/ctcf_analysis.py` |
+| Запустить ChIP-seq валидацию | `scripts/run_chipseq_validation.py` |
 | Добавить шаг в пайплайн | `pipeline/run_pipeline.py` |
 | Добавить/изменить график | `src/visualization.py` → `agent_docs/07_visualization.md` |
 | Проблема с компиляцией OnTAD | `agent_docs/04_build_ontad.md` |
@@ -420,53 +443,88 @@ torch (CUDA 12.1)  # pip install torch --index-url https://download.pytorch.org/
 | logger NameError в `_get_device()` | До init logging | `print()` в этой функции |
 | HTML-визуализация зависает | Plotly chr1@25kb | `generate_html: false` |
 | scKTLD: balance=True | Нормализация ломает структуру | `balance: false` ВСЕГДА |
-| coitad @ 100kb: 16 TADs, median 12Mb | IS-fallback огрубляет при 100kb | Исключить из консенсуса @ 100kb |
-| armatus @ 100kb: 200+ TADs | gamma sweep выбирает слишком малый gamma | Известная проблема, зафиксирована |
-| CTCF-валидация зависает (50kb) | Python for-loop по 44k пиков × 1000 перм | `_count_ctcf_overlaps` векторизован в v3.2 |
+| coitad @ 100kb: 16 TADs | IS-fallback огрубляет при 100kb | Исключить из консенсуса @ 100kb |
+| armatus @ 100kb: 200+ TADs | gamma sweep выбирает малый gamma | Известная проблема, зафиксирована |
+| chr22 CTCF-профиль: пик смещён | Активный регион только 35Mb, CTCF неравномерно | Не использовать chr22. Эталон: chr1@100kb |
+| CTCF-профиль на малых хромосомах | chr21/22 дают ложные сдвиги | Минимум: chr1–chr6 @ ≥50kb |
+| CTCF-валидация зависает (50kb) | Python for-loop по 44k пиков | `_count_ctcf_overlaps` векторизован в v3.2 |
+| `coitad_..._Xbp.bed` в results/tads/ | Битое имя файла от артефакта glob-паттерна | Игнорировать, в консенсус не попадает |
+| topdom: систематический сдвиг +355kb | Артефакт алгоритма (воспроизводится на всех 4 треках) | Отразить в дипломе как ограничение topdom |
+| coitad ChIP-seq: NO_DATA | 15 границ < min_boundaries=30 на chr1@100kb | Ограничение разрешения, отразить в дипломе |
+| SMC3 из wgEncodeRegTfbsClustered | col4 = имя TF только для основных TF, SMC3 — в других колонках | Использовать ENCODE Portal: ENCFF001VFH |
 
 ---
 
 ## 16. Как обновлять этот файл
 
 > docs-first: rules.md обновляется ДО изменения кода.
-> Держать файл ≤ 250 строк — детали выносить в agent_docs/.
+> Держать файл ≤ 300 строк — детали выносить в agent_docs/.
 
 **Чеклист: добавить новый алгоритм:**
-- [ ] §5: добавить строку в таблицу реестра
-- [ ] §8: добавить цвет в ALGO_COLORS
+- [ ] §5: строка в таблице реестра
+- [ ] §8: цвет в ALGO_COLORS
 - [ ] §16: Changelog
-- [ ] `agent_docs/01_algorithms.md`: подраздел с механикой и параметрами
-- [ ] `src/algorithms/run_<algo>.py`
-- [ ] `src/algorithms/__init__.py` (ALGORITHM_REGISTRY)
-- [ ] `config/config.yaml` (блок параметров)
+- [ ] `agent_docs/01_algorithms.md`
+- [ ] `src/algorithms/run_<algo>.py` + `ALGORITHM_REGISTRY`
+- [ ] `config/config.yaml`
 - [ ] `src/visualization.py` (ALGO_COLORS)
-- [ ] `requirements.txt` / `environment.yml`
 - [ ] `tests/test_<algo>.py`
 
 ---
 
 ## 17. Changelog
 
+### v3.4 — 2026-05-20
+
+**Добавлено:**
+- §3: `src/visualization.py` заменён на `visualization_sveta.py` (browser-style + distance-style)
+- §4: `hic_figures_out`, `chipseq_figures_out`, `arrowhead_ref` добавлены в config/config.yaml
+- §6: `compute_tad_consensus()` реально интегрирован в `compute_all_consensus()` (был задекларирован в v3.3, но не вызывался)
+- §7: PNG-профили RAD21/SMC3/H3K4me3/H3K27ac сгенерированы → `results/figures/chipseq_profiles/`
+- §9: структура `results/figures/` разделена на `hic_maps/` + `chipseq_profiles/`
+- §11: Backlog P1-задачи закрыты
+- §15: добавлен known issue `coitad_..._Xbp.bed`
+- `config/config.yaml`: `styles: [browser, distance]`, `max_distance_bp`, `panel_bp`, все 7 цветов
+
+**tad_consensus @ 100kb:** 22 файла, chr1–chr22 (coitad исключён)
+**tad_consensus @ 50kb:** 22 файла, chr1–chr22 (coitad исключён); chr1: 177 доменов
+**Структура figures/:** `hic_maps/` (69 PNG), `chipseq_profiles/` (417 PNG)
+**Jaccard heatmap:** удалён из `run_all_visualization` pipeline
+
+**Затронутые файлы:**
+`src/consensus.py`, `src/visualization.py`, `config/config.yaml`,
+`scripts/run_chipseq_validation.py`, `rules.md`
+
+### v3.3 — 2026-05-19
+
+**Добавлено:**
+- §4: ChIP-seq треки RAD21 (ENCFF001VFE, 23 947 пиков), SMC3 (ENCFF001VFH, 64 597),
+  H3K4me3 (57 476), H3K27ac (56 069) — скачаны в `data/reference/`
+- §4: пути rad21/smc3/h3k4me3/h3k27ac_bed добавлены в config/config.yaml
+- §6: CONSENSUS_COLORS расширен до 7 уровней (был до 4); исправлен `min(support,4)→min(support,7)`
+- §6: `consensus.jaccard_threshold: 0.5` добавлен в config/config.yaml
+- §6: `compute_tad_consensus()` (Union-Find + Jaccard) интегрирован в `compute_all_consensus()`
+- §7: таблица валидаций обновлена; добавлены результаты по всем 4 трекам
+- §7: сводная таблица `results/stats/chipseq_validation_summary.csv`
+- §14: добавлена строка `scripts/run_chipseq_validation.py`
+- §15: новые known issues — PNG-фигуры, topdom +355kb, coitad NO_DATA, SMC3 clustered
+- Новый скрипт: `scripts/run_chipseq_validation.py`
+- Новый модуль: `src/ctcf_analysis.py` (параметризован под любой ChIP-seq трек)
+
+**Smoke-тест consensus.py пройден:** `compute_consensus` + `compute_tad_consensus` ✅
+
+**Затронутые файлы:**
+`src/consensus.py`, `src/ctcf_analysis.py`, `config/config.yaml`,
+`scripts/run_chipseq_validation.py`, `rules.md`
+
 ### v3.2 — 2026-05-15
 
 **Исправлено:**
-- `run_modularity_tad.py` v2.2: O/E нормализация (observed/expected по диагоналям)
-  вместо log1p — полностью убирает distance-decay без bias к размеру TAD;
-  переписан `_dp_segment` (убран pass-through механизм, теперь только реальные сегменты)
-- `run_ontad.py` v2.3: recursive top-down subdivision вместо score-based greedy —
-  рекурсивно заменяет крупные TAD детьми до достижения target; исправлена опечатка
-  `best_dist = best_rows` → `best_dist = dist`
-- `pipeline/run_pipeline.py`: `--algorithms` теперь принимает все 7 алгоритмов
-  (убран `choices=[...]` захардкоженный список, заменён на динамический из ALGORITHM_REGISTRY)
-- `src/validation.py`: `_count_ctcf_overlaps` векторизован через numpy broadcasting
-  (~100x ускорение; 30 мин → 2–5 мин для 50kb chr1–chr22)
-- `config/config.yaml`: `modularity_tad.penalty: null` (был 0.05 — блокировал auto-sweep)
-
-**Добавлено:**
-- Документация known issues: coitad @ 100kb (16 TADs, median 12Mb — unusable),
-  armatus @ 100kb (avg 202 TADs — завышено); оба зафиксированы в §15
-
-**GPU:** GPU2 стал предпочтительным (20GB свободно); GPU3 — резервный
+- `run_modularity_tad.py` v2.2: O/E нормализация вместо log1p
+- `run_ontad.py` v2.3: recursive top-down subdivision
+- `pipeline/run_pipeline.py`: `--algorithms` динамический из ALGORITHM_REGISTRY
+- `src/validation.py`: `_count_ctcf_overlaps` векторизован (~100x ускорение)
+- `config/config.yaml`: `modularity_tad.penalty: null`
 
 **Результаты полного прогона (покрытие):**
 | Алгоритм | 25kb | 50kb | 100kb |
@@ -479,63 +537,12 @@ torch (CUDA 12.1)  # pip install torch --index-url https://download.pytorch.org/
 | ontad | 6 chr, avg 46 | 22 chr, avg 65 | 22 chr, avg 33 |
 | modularity_tad | 6 chr, avg 55 | 22 chr, avg 113 | 22 chr, avg 116 |
 
-**Затронутые файлы:**
-`src/algorithms/run_ontad.py`, `src/algorithms/run_modularity_tad.py`,
-`src/validation.py`, `pipeline/run_pipeline.py`, `config/config.yaml`,
-`rules.md`, `README.md`
-
 ### v3.1 — 2026-05-14
+agent_docs/ создана (10 файлов), workstreams, research backlog, структура диплома.
 
-**Добавлено:**
-- `agent_docs/` — 10 файлов подробной документации по темам
-- `create_agent_docs.py` — скрипт автоматического создания agent_docs/
-- §10: Workstreams (карта параллельной работы с ветками git)
-- §11: Research Backlog (все задачи из комментариев тимлида 12.05.2026)
-- §12: Структура диплома (7 глав с описанием)
-- `thesis/` директория для текста диплома
-- `logs/` директория для логов запусков
-
-**Изменено:**
-- rules.md реструктурирован по принципу Progressive Disclosure (~250 строк)
-- Детали алгоритмов, данных, CTCF, OnTAD-сборки вынесены в agent_docs/
-- §7 CTCF: расширен биологический контекст и диагностика
-- README.md: добавлены разделы для новых участников, workstreams, статус
-
-**Задачи из комментариев тимлида (12.05.2026) — добавлены в Backlog:**
-- Широкий CTCF-профиль ±500kb
-- Наглядная визуализация границ (overlay + zoom)
-- Консенсус по TAD-пересечениям (deepTAD review)
-- Биол. валидация как ground truth
-- Проверка консенсуса на CTCF
-- Воспроизведение результатов алгоритмов из статей
-- GNN на консенсусных границах
-- Статистические методы (Фурье, спектральный, change-point)
-- Обоснование гиперпараметров по хромосомам
-- Доказательство превосходства нового датасета через CTCF
-
-**Затронутые файлы:**
-`rules.md`, `README.md`, `agent_docs/` (создана), `create_agent_docs.py` (создан),
-`thesis/` (создана), `logs/` (создана)
-
-### v2.1 — 2026-05-13
-
-**Исправлено:**
-- OnTAD: `depth==1` → `_get_max_nonoverlapping()` (листовые TAD из иерархии)
-- ModularityTAD: `mean(B)` → `intra/inter ratio` objective
-- Auto-penalty: нормировка на `percentile_95(scores)` вместо `max`
-
-**Затронутые файлы:**
-`src/algorithms/run_ontad.py`, `src/algorithms/run_modularity_tad.py`, `rules.md`
-
-### v2.0 — 2026-05-12
-
-**Добавлено:** DI+HMM, OnTAD, ModularityTAD (3 новых алгоритма).
-ALGORITHM_REGISTRY: 4 → 7 алгоритмов. Инструкция сборки OnTAD.
-
-### v1.3 — 2026-05-03
-
+### v2.0–v1.3
 *(см. историю git)*
 
 ---
 
-*rules.md v3.1 | TAD Consensus Pipeline | hg19 | GSE63525 GM12878*
+*rules.md v3.4 | TAD Consensus Pipeline | hg19 | GSE63525 GM12878*

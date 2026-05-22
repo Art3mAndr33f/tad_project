@@ -26,9 +26,12 @@ logger = logging.getLogger(__name__)
 
 # Константы цветовой схемы
 CONSENSUS_COLORS = {
-    2: "#FFD700",   # жёлтый  — слабый
-    3: "#FF8C00",   # оранжевый — умеренный
-    4: "#00C800",   # зелёный  — сильный
+    2: "#FFD700",   # жёлтый       — слабый    (2/7)
+    3: "#FF8C00",   # оранжевый    — умеренный (3/7)
+    4: "#00C800",   # зелёный      — сильный   (4/7)
+    5: "#008000",   # тёмно-зелёный             (5/7)
+    6: "#0000CD",   # синий                     (6/7)
+    7: "#8B008B",   # фиолетовый   — максимум  (7/7)
 }
 
 
@@ -160,7 +163,7 @@ def compute_consensus(
                     support += 1
                     break
 
-        color = CONSENSUS_COLORS.get(support, "")
+        color = CONSENSUS_COLORS.get(min(support, 7), "")
         records.append({
             "chrom":    chrom,
             "position": center_pos,
@@ -173,11 +176,11 @@ def compute_consensus(
 
     logger.info(
         "[Consensus] %s @ %d bp: %d кластеров → %d консенсусных границ "
-        "(support≥%d): 2алг=%d, 3алг=%d, 4алг=%d",
+        "(support≥%d): 2алг=%d, 3алг=%d, ≥4алг=%d",
         chrom, resolution, len(clusters), len(df_consensus), min_support,
         (df_consensus["support"] == 2).sum(),
         (df_consensus["support"] == 3).sum(),
-        (df_consensus["support"] == 4).sum(),
+        (df_consensus["support"] >= 4).sum(),
     )
     return df_consensus
 
@@ -227,6 +230,138 @@ def load_consensus_bed(bed_path: str) -> pd.DataFrame:
     df["support"]  = df["score"]
     return df[["chrom", "position", "support"]]
 
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# P2: Консенсус по перекрытию целых TAD-доменов (Jaccard-based)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _jaccard(s_i: int, e_i: int, s_j: int, e_j: int) -> float:
+    """Jaccard-индекс двух интервалов."""
+    inter = max(0, min(e_i, e_j) - max(s_i, s_j))
+    if inter == 0:
+        return 0.0
+    union = max(e_i, e_j) - min(s_i, s_j)
+    return inter / union if union > 0 else 0.0
+
+
+def compute_tad_consensus(
+    algorithm_results: Dict[str, pd.DataFrame],
+    chrom: str,
+    resolution: int,
+    jaccard_threshold: float = 0.5,
+    min_support: int = 2,
+) -> pd.DataFrame:
+    """
+    Консенсус по перекрытию целых TAD-доменов.
+
+    Два TAD считаются «согласованными» если их Jaccard ≥ jaccard_threshold.
+    Кластеризация Union-Find по всем парам TAD из разных алгоритмов.
+    Координаты кластера — медиана start/end входящих TAD.
+    Support — число уникальных алгоритмов в кластере.
+
+    Parameters
+    ----------
+    algorithm_results  : {algo_name: domains_DataFrame}
+    chrom              : хромосома (с префиксом chr)
+    resolution         : разрешение в bp
+    jaccard_threshold  : порог Jaccard для объединения (default 0.5)
+    min_support        : минимум алгоритмов для консенсуса (default 2)
+
+    Returns
+    -------
+    pd.DataFrame(chrom, start, end, support, algorithms)
+      support    : число уникальных алгоритмов в кластере
+      algorithms : строка с именами алгоритмов через запятую
+    """
+    # ── Собрать все TAD с меткой алгоритма ───────────────────────────────────
+    all_tads: List[Tuple[str, int, int]] = []  # (algo, start, end)
+    for algo, df in algorithm_results.items():
+        if df is None or df.empty:
+            continue
+        df_c = df[df["chrom"] == chrom] if "chrom" in df.columns else df
+        if df_c.empty:
+            continue
+        for _, row in df_c.iterrows():
+            all_tads.append((algo, int(row["start"]), int(row["end"])))
+
+    n = len(all_tads)
+    if n < 2:
+        logger.debug(
+            "[TAD-Consensus] Недостаточно TAD для %s @ %d (%d шт.)", chrom, resolution, n
+        )
+        return pd.DataFrame(columns=["chrom", "start", "end", "support", "algorithms"])
+
+    # ── Union-Find ───────────────────────────────────────────────────────────
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: int, y: int) -> None:
+        parent[_find(x)] = _find(y)
+
+    # Попарное сравнение TAD из разных алгоритмов
+    for i in range(n):
+        algo_i, s_i, e_i = all_tads[i]
+        for j in range(i + 1, n):
+            algo_j, s_j, e_j = all_tads[j]
+            if algo_i == algo_j:
+                continue  # не объединяем TAD одного алгоритма
+            if _jaccard(s_i, e_i, s_j, e_j) >= jaccard_threshold:
+                _union(i, j)
+
+    # ── Группировка кластеров ────────────────────────────────────────────────
+    from collections import defaultdict as _dd
+    clusters: Dict[int, List[int]] = _dd(list)
+    for i in range(n):
+        clusters[_find(i)].append(i)
+
+    records = []
+    for root, members in clusters.items():
+        algos = {all_tads[m][0] for m in members}
+        support = len(algos)
+        if support < min_support:
+            continue
+
+        starts = np.array([all_tads[m][1] for m in members], dtype=np.int64)
+        ends   = np.array([all_tads[m][2] for m in members], dtype=np.int64)
+        records.append({
+            "chrom":      chrom,
+            "start":      int(np.median(starts)),
+            "end":        int(np.median(ends)),
+            "support":    support,
+            "algorithms": ",".join(sorted(algos)),
+        })
+
+    if not records:
+        return pd.DataFrame(columns=["chrom", "start", "end", "support", "algorithms"])
+
+    df_out = pd.DataFrame(records).sort_values("start").reset_index(drop=True)
+    logger.info(
+        "[TAD-Consensus] %s @ %d: %d TAD-кластеров (support≥%d, Jaccard≥%.2f)",
+        chrom, resolution, len(df_out), min_support, jaccard_threshold,
+    )
+    return df_out
+
+
+def save_tad_consensus_bed(
+    df: pd.DataFrame,
+    out_path: str,
+) -> None:
+    """Сохранить TAD-консенсус в BED-формате с колонкой support."""
+    import os
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out = df[["chrom", "start", "end"]].copy()
+    out["name"]   = "tad_consensus_support" + df["support"].astype(str)
+    out["score"]  = df["support"]
+    out["strand"] = "."
+    out.to_csv(out_path, sep="\t", header=False, index=False)
+    logger.debug("TAD-Consensus BED: %s (%d доменов)", out_path, len(out))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Batch-консенсус
@@ -282,5 +417,24 @@ def compute_all_consensus(
                     out_dir, f"consensus_{chrom}_{res}bp.bed"
                 )
                 save_consensus_bed(df_consensus, bed_path, res)
+
+            # ── TAD-консенсус (Jaccard Union-Find) ──────────────────────────
+            jaccard_threshold = cfg["consensus"].get("jaccard_threshold", 0.5)
+            tad_df = compute_tad_consensus(
+                algo_dfs, chrom, res,
+                jaccard_threshold=jaccard_threshold,
+                min_support=min_support,
+            )
+            if not tad_df.empty:
+                tad_out_dir = out_dir if out_dir is not None else cfg.get(
+                    "paths", {}).get("consensus_out", "results/consensus")
+                tad_path = os.path.join(
+                    tad_out_dir, f"tad_consensus_{chrom}_{res}bp.bed"
+                )
+                save_tad_consensus_bed(tad_df, tad_path)
+                logger.info(
+                    "[TAD-Consensus] сохранён: %s (%d доменов)",
+                    tad_path, len(tad_df),
+                )
 
     return dict(results)

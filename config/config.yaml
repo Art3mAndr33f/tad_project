@@ -17,7 +17,9 @@ paths:
   tads_out:       "results/tads"
   consensus_out:  "results/consensus"
   stats_out:      "results/stats"
-  figures_out:    "results/figures"
+  figures_out:         "results/figures"
+  hic_figures_out:     "results/figures/hic_maps"
+  chipseq_figures_out: "results/figures/chipseq_profiles"
   report:         "results/report.html"
   armatus_bin:    "tools/armatus/armatus"
   coitad_dir:     "tools/coiTAD"
@@ -26,6 +28,11 @@ paths:
   hic_file:       "data/raw/GSE63525_GM12878_insitu_primary_30.hic"
   arrowhead_file: "data/reference/GSE63525_GM12878_primary+replicate_Arrowhead_domainlist.txt"
   ctcf_bed:       "data/reference/GM12878_CTCF_peaks_hg19.bed"
+  rad21_bed:   "data/reference/GM12878_RAD21_peaks_hg19.bed"
+  smc3_bed:    "data/reference/GM12878_SMC3_peaks_hg19.bed"
+  h3k4me3_bed: "data/reference/GM12878_H3K4me3_peaks_hg19.bed"
+  h3k27ac_bed: "data/reference/GM12878_H3K27ac_peaks_hg19.bed"
+  arrowhead_ref:  "data/reference/GSE63525_GM12878_primary+replicate_Arrowhead_domainlist.txt"
 
 # ─── Разрешения и хромосомы ──────────────────────────
 resolutions:        [10000, 25000, 50000, 100000]   # в bp
@@ -90,6 +97,7 @@ algorithms:
 consensus:
   tolerance_bins: 1             # ±1 bin при кластеризации
   min_support: 2                # минимальное число алгоритмов
+  jaccard_threshold: 0.5        # порог Jaccard для TAD-консенсуса
   colors:
     2: "#FFD700"   # жёлтый  — слабый
     3: "#FF8C00"   # оранжевый — умеренный
@@ -114,8 +122,14 @@ visualization:
   format: "png"
   figsize: [18, 14]
   generate_html: false           # plotly интерактивный
+  styles: ["browser", "distance"]  # два вида Hi-C карт
+  max_distance_bp: 3000000         # макс. расстояние от диагонали
+  panel_bp: 10000000               # ширина панели (bp)
   algorithm_colors:
-    armatus: "#1f77b4"
-    topdom:  "#ff7f0e"
-    scktld:  "#2ca02c"
-    coitad:  "#d62728"
+    armatus:        "#1f77b4"
+    topdom:         "#ff7f0e"
+    scktld:         "#2ca02c"
+    coitad:         "#d62728"
+    dihmm:          "#9467bd"
+    ontad:          "#e377c2"
+    modularity_tad: "#17becf"
