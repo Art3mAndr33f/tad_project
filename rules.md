@@ -357,9 +357,9 @@ df.columns == ["chrom", "start", "end"]  # строго
   ```
   Исключения: coitad @ 100kb (unusable), scKTLD только chr17–chr22 @ 25kb.
 
-- [ ] **Наглядная overlay-визуализация границ:**
-  Overlay алгоритмов + консенсуса на Hi-C heatmap, zoom на локусы.
-  → `agent_docs/07_visualization.md`
+- [x] ~~**Наглядная overlay-визуализация границ** ✅ v3.5~~
+  weak consensus (dashed lines) + strong consensus (filled axvspan)
+  поверх Hi-C ленты в `plot_tad_browser_view`. → `src/visualization.py`
 
 ### 🟢 P2 — Развитие
 
@@ -448,6 +448,8 @@ torch (CUDA 12.1)
 | chr22 CTCF-профиль: пик смещён | Активный регион только 35Mb, CTCF неравномерно | Не использовать chr22. Эталон: chr1@100kb |
 | CTCF-профиль на малых хромосомах | chr21/22 дают ложные сдвиги | Минимум: chr1–chr6 @ ≥50kb |
 | CTCF-валидация зависает (50kb) | Python for-loop по 44k пиков | `_count_ctcf_overlaps` векторизован в v3.2 |
+| `from __future__` не первой строкой | `import os` вставился выше | Держать `from __future__ import annotations` строкой №1 |
+| Arrowhead: `invalid literal 'x1'` | Заголовок chr1/x1/x2 не числа | Читать с `header=0`, переименовывать колонки |
 | `coitad_..._Xbp.bed` в results/tads/ | Битое имя файла от артефакта glob-паттерна | Игнорировать, в консенсус не попадает |
 | topdom: систематический сдвиг +355kb | Артефакт алгоритма (воспроизводится на всех 4 треках) | Отразить в дипломе как ограничение topdom |
 | coitad ChIP-seq: NO_DATA | 15 границ < min_boundaries=30 на chr1@100kb | Ограничение разрешения, отразить в дипломе |
@@ -474,6 +476,38 @@ torch (CUDA 12.1)
 
 ## 17. Changelog
 
+### v3.5 — 2026-05-28
+
+**Добавлено:**
+- §6: `compute_strong_tad_consensus()` — строгий TAD-консенсус:
+  TAD включается только если |start_i−start_j| ≤ tol·res AND |end_i−end_j| ≤ tol·res
+  у ≥ min_support алгоритмов. Файлы: `results/consensus/strong_tad_consensus_{chrom}_{res}bp.bed`
+- §6: `config/consensus.strong_boundary_tolerance_bins: 1` добавлен в config/config.yaml
+- §7 (визуализация): `plot_tad_browser_view` расширен двумя слоями:
+  weak consensus → вертикальные dashed-линии; strong consensus → заполненные axvspan
+- §7: `_load_consensus_bed()` — хелпер чтения BED с/без заголовка (поддержка обоих форматов)
+- §11: Backlog P1 "наглядная overlay-визуализация" ✅ закрыта
+- §15: новые known issues (Arrowhead заголовок, `from __future__` позиция)
+- `scripts/run_chipseq_validation.py`: `run_consensus_chipseq_validation()`,
+  `_boundaries_from_domain_bed()` — прогон strong/weak консенсусов через ChIP-seq профили
+- Summary обновлён: 8 строк (strong_consensus + weak_consensus × 4 трека)
+- 4 сравнительных PNG: `{track}_strong_vs_weak_consensus_chr1_100000bp.png`
+
+**Ключевые результаты (chr1 @ 100kb):**
+| Трек    | strong_consensus | weak_consensus | Arrowhead |
+|---------|-----------------|----------------|-----------|
+| RAD21   | STRONG 1.382    | STRONG 1.317   | 1.457     |
+| SMC3    | GOOD 1.187      | GOOD 1.230     | 1.252     |
+| H3K4me3 | GOOD 1.218      | GOOD 1.210     | 1.142     |
+| H3K27ac | GOOD 1.107      | GOOD 1.140     | 1.116     |
+
+Strong > weak по RAD21 (cohesin-специфичный маркер) — строгий критерий
+границ захватывает биологически реальные loop-якоря точнее Jaccard-перекрытия.
+
+**Затронутые файлы:**
+`src/consensus.py`, `src/visualization.py`, `config/config.yaml`,
+`scripts/run_chipseq_validation.py`, `rules.md`
+
 ### v3.4 — 2026-05-20
 
 **Добавлено:**
@@ -488,7 +522,7 @@ torch (CUDA 12.1)
 
 **tad_consensus @ 100kb:** 22 файла, chr1–chr22 (coitad исключён)
 **tad_consensus @ 50kb:** 22 файла, chr1–chr22 (coitad исключён); chr1: 177 доменов
-**Структура figures/:** `hic_maps/` (69 PNG), `chipseq_profiles/` (417 PNG)
+**Структура figures/:** `hic_maps/` (69 PNG), `chipseq_profiles/` (417 PNG + 4 strong_vs_weak)
 **Jaccard heatmap:** удалён из `run_all_visualization` pipeline
 
 **Затронутые файлы:**

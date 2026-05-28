@@ -363,6 +363,136 @@ def save_tad_consensus_bed(
     out.to_csv(out_path, sep="\t", header=False, index=False)
     logger.debug("TAD-Consensus BED: %s (%d доменов)", out_path, len(out))
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Строгий TAD-консенсус (обе границы совпали)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_strong_tad_consensus(
+    algorithm_results: Dict[str, pd.DataFrame],
+    chrom: str,
+    resolution: int,
+    tolerance_bins: int = 1,
+    min_support: int = 2,
+) -> pd.DataFrame:
+    """
+    Строгий TAD-консенсус: TAD включается только если ОБЕ границы
+    (start И end) совпадают у ≥ min_support алгоритмов с точностью
+    до tolerance_bins бинов.
+
+    Критерий совпадения пары (i, j) из РАЗНЫХ алгоритмов:
+        |start_i - start_j| <= tolerance_bins * resolution  AND
+        |end_i   - end_j  | <= tolerance_bins * resolution
+
+    Алгоритм:
+        1. Собрать все TAD как записи (algo, start, end).
+        2. Для каждой пары из разных алгоритмов проверить критерий → Union-Find.
+        3. Для каждого кластера:
+           - representative start = median start всех элементов кластера,
+             округлённый до бина
+           - representative end   = median end, округлённый до бина
+           - support = число РАЗЛИЧНЫХ алгоритмов в кластере
+        4. Вернуть кластеры с support >= min_support, отсортированные по start.
+
+    Parameters
+    ----------
+    algorithm_results : {algo_name: DataFrame(chrom, start, end)}
+    chrom             : "chr1" и т.д. (с префиксом)
+    resolution        : разрешение в bp (25000 / 50000 / 100000)
+    tolerance_bins    : допуск в бинах (default=1 из config)
+    min_support       : минимальное число алгоритмов в кластере
+
+    Returns
+    -------
+    pd.DataFrame с колонками: chrom, start, end, support, algorithms
+    """
+    from collections import defaultdict as _dd
+
+    tol_bp = tolerance_bins * resolution
+
+    # ── 1. Собрать все TAD данного chrom ──────────────────────────────────
+    all_tads: List[Tuple[str, int, int]] = []  # (algo, start, end)
+    for algo, df in algorithm_results.items():
+        if df is None or df.empty:
+            continue
+        df_c = df[df["chrom"] == chrom] if "chrom" in df.columns else df
+        if df_c.empty:
+            continue
+        for _, row in df_c.iterrows():
+            all_tads.append((algo, int(row["start"]), int(row["end"])))
+
+    n = len(all_tads)
+    if n < 2:
+        logger.debug(
+            "[StrongConsensus] Недостаточно TAD для %s @ %d (%d шт.)",
+            chrom, resolution, n,
+        )
+        return pd.DataFrame(columns=["chrom", "start", "end", "support", "algorithms"])
+
+    # ── 2. Union-Find ──────────────────────────────────────────────────────
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(x: int, y: int) -> None:
+        parent[_find(x)] = _find(y)
+
+    for i in range(n):
+        algo_i, s_i, e_i = all_tads[i]
+        for j in range(i + 1, n):
+            algo_j, s_j, e_j = all_tads[j]
+            if algo_i == algo_j:
+                continue  # пары внутри одного алгоритма не объединяем
+            if abs(s_i - s_j) <= tol_bp and abs(e_i - e_j) <= tol_bp:
+                _union(i, j)
+
+    # ── 3. Агрегировать кластеры ──────────────────────────────────────────
+    clusters: Dict[int, List[int]] = _dd(list)
+    for i in range(n):
+        clusters[_find(i)].append(i)
+
+    records = []
+    for root, members in clusters.items():
+        algos = {all_tads[m][0] for m in members}
+        support = len(algos)
+        if support < min_support:
+            continue
+
+        starts = np.array([all_tads[m][1] for m in members], dtype=np.int64)
+        ends   = np.array([all_tads[m][2] for m in members], dtype=np.int64)
+
+        # Округлить медиану до бина
+        rep_start = (int(np.median(starts)) // resolution) * resolution
+        rep_end   = (int(np.median(ends))   // resolution) * resolution
+        if rep_end <= rep_start:
+            rep_end = rep_start + resolution
+
+        records.append({
+            "chrom":      chrom,
+            "start":      rep_start,
+            "end":        rep_end,
+            "support":    support,
+            "algorithms": ",".join(sorted(algos)),
+        })
+
+    if not records:
+        logger.info(
+            "[StrongConsensus] Нет кластеров с support≥%d для %s @ %d bp",
+            min_support, chrom, resolution,
+        )
+        return pd.DataFrame(columns=["chrom", "start", "end", "support", "algorithms"])
+
+    df_out = pd.DataFrame(records).sort_values("start").reset_index(drop=True)
+    logger.info(
+        "[StrongConsensus] %s @ %d bp → %d строгих TAD (tol=%d бин, support≥%d)",
+        chrom, resolution, len(df_out), tolerance_bins, min_support,
+    )
+    return df_out
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Batch-консенсус
 # ──────────────────────────────────────────────────────────────────────────────
@@ -435,6 +565,27 @@ def compute_all_consensus(
                 logger.info(
                     "[TAD-Consensus] сохранён: %s (%d доменов)",
                     tad_path, len(tad_df),
+                )
+
+            # ── Строгий TAD-консенсус (обе границы совпали) ─────────────────
+            strong_tol = cfg["consensus"].get("strong_boundary_tolerance_bins", 1)
+            strong_df = compute_strong_tad_consensus(
+                algorithm_results=algo_dfs,
+                chrom=chrom,
+                resolution=res,
+                tolerance_bins=strong_tol,
+                min_support=min_support,
+            )
+            if not strong_df.empty:
+                strong_out_dir = out_dir if out_dir is not None else cfg.get(
+                    "paths", {}).get("consensus_out", "results/consensus")
+                strong_tad_path = os.path.join(
+                    strong_out_dir, f"strong_tad_consensus_{chrom}_{res}bp.bed"
+                )
+                save_tad_consensus_bed(strong_df, strong_tad_path)
+                logger.info(
+                    "[StrongConsensus] сохранён: %s (%d доменов)",
+                    strong_tad_path, len(strong_df),
                 )
 
     return dict(results)

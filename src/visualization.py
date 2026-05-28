@@ -1,3 +1,5 @@
+from __future__ import annotations
+import os
 """
 visualization_sveta.py
 ================
@@ -26,7 +28,6 @@ visualization_sveta.py
         --style both
 """
 
-from __future__ import annotations
 
 import logging
 import os
@@ -607,6 +608,40 @@ def _build_dist_pos_map(log_sub, max_d):
 # ВАРИАНТ 3: Browser-style
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _load_consensus_bed(path) -> "pd.DataFrame":
+    """Загрузить BED-файл консенсусных доменов (с заголовком support).
+
+    Принимает str или Path. Возвращает DataFrame(chrom,start,end,support)
+    или пустой DataFrame при отсутствии файла / некорректном формате.
+    """
+    from pathlib import Path as _Path
+    import pandas as _pd
+
+    p = _Path(path)
+    if not p.exists():
+        logger.debug("_load_consensus_bed: файл не найден: %s", p)
+        return _pd.DataFrame(columns=["chrom", "start", "end", "support"])
+    try:
+        df = _pd.read_csv(p, sep="\t", comment="#")
+    except Exception as exc:
+        logger.warning("_load_consensus_bed: ошибка чтения %s: %s", p, exc)
+        return _pd.DataFrame(columns=["chrom", "start", "end", "support"])
+    for col in ("chrom", "start", "end", "support"):
+        if col not in df.columns:
+            # BED без заголовка (4-я колонка = name типа tad_consensus_support3)
+            if col == "support" and df.shape[1] >= 5:
+                try:
+                    df["support"] = df.iloc[:, 4].astype(int)
+                except Exception:
+                    df["support"] = 2
+            elif col == "support":
+                df["support"] = 2
+            else:
+                logger.warning("_load_consensus_bed: нет колонки '%s' в %s", col, p)
+                return _pd.DataFrame(columns=["chrom", "start", "end", "support"])
+    return df[["chrom", "start", "end", "support"]].copy()
+
+
 def plot_tad_browser_view(
     matrix: np.ndarray,
     algo_results: Dict[str, pd.DataFrame],
@@ -618,6 +653,9 @@ def plot_tad_browser_view(
     loop_results: Optional[Dict[str, pd.DataFrame]] = None,
     dpi: int = 300,
     figsize: Optional[Tuple[float, float]] = None,
+    weak_consensus_path=None,    # str | None → tad_consensus_*.bed
+    strong_consensus_path=None,  # str | None → strong_tad_consensus_*.bed
+
 ) -> None:
     _ensure_parent_dir(out_path)
     n_bins = matrix.shape[0]
@@ -672,6 +710,52 @@ def plot_tad_browser_view(
 
         for x_mb, col, _ in _consensus_in_panel(consensus_df, resolution, w0, w1):
             ax_hic.axvline(x=x_mb, color=col, lw=0.9, alpha=0.9, zorder=4)
+
+            # ── weak consensus: вертикальные линии (dashed) ──
+            if weak_consensus_path is not None:
+                _wdf = _load_consensus_bed(weak_consensus_path)
+                if not _wdf.empty:
+                    _wdf = _wdf[
+                        (_wdf['chrom'] == chrom) &
+                        (_wdf['end']   > w0 * 1e6) &
+                        (_wdf['start'] < w1 * 1e6)
+                    ]
+                for _, _row in _wdf.iterrows():
+                    _sup = min(int(_row['support']), 7)
+                    _col = CONSENSUS_COLORS.get(_sup, '#FFD700')
+                    for _bnd_bp in [_row['start'], _row['end']]:
+                        ax_hic.axvline(
+                            x=_bnd_bp / 1e6, color=_col,
+                            linewidth=1.0, alpha=0.70,
+                            linestyle='--', zorder=5,
+                        )
+
+            # ── strong consensus: заполненные прямоугольники ──
+            if strong_consensus_path is not None:
+                _sdf = _load_consensus_bed(strong_consensus_path)
+                if not _sdf.empty:
+                    _sdf = _sdf[
+                        (_sdf['chrom'] == chrom) &
+                        (_sdf['end']   > w0 * 1e6) &
+                        (_sdf['start'] < w1 * 1e6)
+                    ]
+                for _, _row in _sdf.iterrows():
+                    _sup = min(int(_row['support']), 7)
+                    _col = CONSENSUS_COLORS.get(_sup, '#FFD700')
+                    ax_hic.axvspan(
+                        xmin=max(_row['start'] / 1e6, w0),
+                        xmax=min(_row['end']   / 1e6, w1),
+                        alpha=0.18, color=_col,
+                        zorder=2, linewidth=0,
+                    )
+                    for _bnd_bp in [_row['start'], _row['end']]:
+                        if w0 <= _bnd_bp / 1e6 <= w1:
+                            ax_hic.axvline(
+                                x=_bnd_bp / 1e6, color=_col,
+                                linewidth=2.0, alpha=0.90,
+                                linestyle='-', zorder=6,
+                            )
+
 
         for i, (algo, df) in enumerate(algo_items):
             ax = fig.add_subplot(subgs[i + 1, 0], sharex=ax_hic)
@@ -964,6 +1048,48 @@ def plot_ctcf_profile_all_algos(
             except Exception as exc:
                 logger.warning("Arrowhead profile error: %s", exc)
 
+    # ── Слой слабого консенсуса: вертикальные линии на границах ──
+    if weak_consensus_path is not None:
+        _wdf = _load_consensus_bed(weak_consensus_path)
+        if not _wdf.empty:
+            _wdf = _wdf[
+                (_wdf['chrom'] == chrom) &
+                (_wdf['end']   > region_start) &
+                (_wdf['start'] < region_end)
+            ]
+        for _, _row in _wdf.iterrows():
+            _sup = min(int(_row['support']), 7)
+            _col = CONSENSUS_COLORS.get(_sup, '#FFD700')
+            for _bnd in [_row['start'], _row['end']]:
+                ax_hic.axvline(
+                    x=_bnd, color=_col, linewidth=1.0,
+                    alpha=0.70, linestyle='--', zorder=3,
+                )
+
+    # ── Слой сильного консенсуса: заполненные прямоугольники ────────
+    if strong_consensus_path is not None:
+        _sdf = _load_consensus_bed(strong_consensus_path)
+        if not _sdf.empty:
+            _sdf = _sdf[
+                (_sdf['chrom'] == chrom) &
+                (_sdf['end']   > region_start) &
+                (_sdf['start'] < region_end)
+            ]
+        for _, _row in _sdf.iterrows():
+            _sup = min(int(_row['support']), 7)
+            _col = CONSENSUS_COLORS.get(_sup, '#FFD700')
+            ax_hic.axvspan(
+                xmin=max(float(_row['start']), float(region_start)),
+                xmax=min(float(_row['end']),   float(region_end)),
+                alpha=0.18, color=_col, zorder=2, linewidth=0,
+            )
+            for _bnd in [_row['start'], _row['end']]:
+                if region_start <= _bnd <= region_end:
+                    ax_hic.axvline(
+                        x=_bnd, color=_col, linewidth=2.0,
+                        alpha=0.90, linestyle='-', zorder=4,
+                    )
+
     for algo, df in algo_results.items():
         if df is None or df.empty:
             continue
@@ -1061,7 +1187,9 @@ def run_all_visualization(
                 try:
                     plot_tad_browser_view(
                         matrix, algo_dfs, cons_df, chrom, res, path,
-                        cfg=cfg, loop_results=loop_dfs or None, dpi=dpi)
+                        cfg=cfg, loop_results=loop_dfs or None, dpi=dpi,
+                    weak_consensus_path=weak_path,
+                    strong_consensus_path=strong_path)
                 except Exception as exc:
                     logger.error("Browser-view %s@%d: %s", chrom, res, exc)
 
@@ -1291,7 +1419,8 @@ def _demo():
                 consensus_df=None, chrom=chrom,
                 resolution=resolution, out_path=out_path,
                 cfg=cfg, dpi=args.dpi,
-            )
+                    weak_consensus_path=weak_path,
+                    strong_consensus_path=strong_path)
         else:
             plot_tad_distance_view(
                 matrix=matrix, algo_results=algo_results,

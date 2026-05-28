@@ -98,6 +98,7 @@ consensus:
   tolerance_bins: 1             # ±1 bin при кластеризации
   min_support: 2                # минимальное число алгоритмов
   jaccard_threshold: 0.5        # порог Jaccard для TAD-консенсуса
+  strong_boundary_tolerance_bins: 1   # ±1 бин на каждую границу (start И end)
   colors:
     2: "#FFD700"   # жёлтый  — слабый
     3: "#FF8C00"   # оранжевый — умеренный
