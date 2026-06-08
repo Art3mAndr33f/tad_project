@@ -295,9 +295,6 @@ tad_consensus/
 │   ├── test_consensus.py
 │   └── test_statistics.py
 │
-├── notebooks/
-│   └── exploration.ipynb
-│
 ├── thesis/                   ← текст диплома
 │   ├── chapters/
 │   └── figures/              ← симлинки из results/figures/
@@ -366,7 +363,7 @@ results/
 | **WS-1: Algorithms** | `ws/algorithms` | `src/algorithms/`, `tools/` | 🟡 Active |
 | **WS-2: Visualization** | `ws/visualization` | `src/visualization.py`, `results/figures/` | 🔲 Открыт |
 | **WS-3: Validation** | `ws/validation` | `src/validation.py`, `src/statistics.py`, `src/consensus.py` | 🔴 Blocked |
-| **WS-4: Thesis** | `ws/thesis` | `thesis/`, `notebooks/` | 🔲 Открыт |
+| **WS-4: Thesis** | `ws/thesis` | `thesis/` | 🔲 Открыт |
 
 **Золотые правила:**
 - Работай только в своей зоне ответственности

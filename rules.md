@@ -323,7 +323,7 @@ df.columns == ["chrom", "start", "end"]  # строго
 | WS-1: Algorithms | `ws/algorithms` | `src/algorithms/`, `tools/` |
 | WS-2: Visualization | `ws/visualization` | `src/visualization.py`, `results/figures/` |
 | WS-3: Validation | `ws/validation` | `src/validation.py`, `src/ctcf_analysis.py`, `src/consensus.py` |
-| WS-4: Thesis | `ws/thesis` | `thesis/`, `notebooks/` |
+| WS-4: Thesis | `ws/thesis` | `thesis/` |
 
 **Подробности → `agent_docs/09_workstreams.md`**
 
@@ -399,6 +399,7 @@ numpy>=1.24, scipy>=1.11, pandas>=2.0, scikit-learn>=1.3
 matplotlib>=3.7, seaborn>=0.12, plotly>=5.18
 PyYAML>=6.0, tqdm>=4.66, jinja2>=3.1, click>=8.1
 hmmlearn>=0.3.3
+ruptures>=1.1.7
 cooler>=0.9.3, pybedtools>=0.9.1, pyranges>=0.0.129
 pytest>=7.4, pytest-cov>=4.1
 torch (CUDA 12.1)

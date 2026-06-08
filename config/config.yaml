@@ -123,7 +123,7 @@ visualization:
   format: "png"
   figsize: [18, 14]
   generate_html: false           # plotly интерактивный
-  styles: ["browser", "distance"]  # два вида Hi-C карт
+  styles: ["browser"] #, "distance"]  # два вида Hi-C карт
   max_distance_bp: 3000000         # макс. расстояние от диагонали
   panel_bp: 10000000               # ширина панели (bp)
   algorithm_colors:
@@ -134,3 +134,47 @@ visualization:
     dihmm:          "#9467bd"
     ontad:          "#e377c2"
     modularity_tad: "#17becf"
+
+# ── Statistical Methods ──────────────────────────────────────────────────────
+weighted_consensus:
+  theta: 0.4                              # boundary inclusion threshold [0, 1]
+  weight_track: "rad21"                   # ChIP-seq track for weights
+  exclude_verdicts: ["NO_DATA", "SHIFTED"]  # these algorithms → weight 0.0
+
+  # Нелинейный трансформ весов (применяется ПОСЛЕ фильтрации exclude_verdicts)
+  # "linear"  — w = cr                             (backward-compatible default)
+  # "power"   — w = max(0, cr - baseline)^gamma    (рекомендуется: gamma=2.0)
+  # "softmax" — w = exp(alpha * (cr - baseline))   (мягкое усиление)
+  # "zscore"  — w = max(0, (cr - mu) / sigma)      (робастный, нет гиперпарам.)
+  weight_transform: "power"
+  transform_params:
+    baseline: 1.0   # cr < baseline → вес 0.0 (topdom cr=0.798 → 0 автоматически)
+    gamma: 2.0      # степень усиления разрыва между алгоритмами
+    alpha: 5.0      # для softmax (не используется при power)
+  exclude_from_sources: ["weak_consensus", "strong_consensus", "Arrowhead"]
+
+
+probabilistic:
+  theta: 0.5              # posterior threshold for boundary inclusion
+  k_sens: 8.0             # sigmoid steepness for sensitivity init
+  k_prior: 3.0            # sigmoid steepness for Hi-C prior
+  global_prior: 0.10      # fallback prior when matrix unavailable
+  max_iter: 50            # maximum EM iterations
+  em_tol: 0.0001          # log-likelihood convergence threshold
+  fpr_min: 0.01           # minimum FPR clamp
+  fpr_max: 0.60           # maximum FPR clamp
+  sens_min: 0.50          # minimum sensitivity clamp
+  sens_max: 0.99          # maximum sensitivity clamp
+
+permutation:
+  window_bp: 50000                        # ChIP-seq counting window around boundary
+  n_permutations: 1000                    # random draws per boundary
+  fdr_threshold: 0.05                     # Benjamini-Hochberg FDR cutoff
+  telomere_margin_bp: 3000000             # exclude chromosome ends from random draws
+
+changepoint:
+  window_bins: 5                          # insulation score diamond half-size
+  beta_min: 0.5                           # PELT penalty grid start
+  beta_max: 5.0                           # PELT penalty grid end
+  n_beta: 10                              # number of penalty values
+  min_beta_support: 3                     # boundary must appear at ≥ N beta values
