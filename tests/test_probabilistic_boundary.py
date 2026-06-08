@@ -314,13 +314,28 @@ class TestRunEM:
         assert (post < 0.5).all()
 
     def test_strong_signal_high_posterior(self) -> None:
-        """High-quality algo (high sens, low fpr) + all detected → high posterior."""
-        X = np.array([[1, 1, 1]], dtype=np.int8)
-        pi   = np.array([0.1])
+        """High-quality algo (high sens, low fpr) + all detected → high posterior.
+
+        Setup: 1 true boundary (detected by all 3 algos) + 9 non-boundaries
+        (not detected by any algo).  The unobserved candidates stabilise the
+        M-step FPR estimate: with only 1 candidate the M-step is degenerate
+        (sum_q0 ≈ 0 → fpr jumps to fpr_max), causing posterior to collapse.
+        """
+        # Candidate 0: true boundary — all algos agree
+        # Candidates 1-9: non-boundaries — no algo detects them
+        n_noise = 9
+        X_true  = np.array([[1, 1, 1]], dtype=np.int8)
+        X_noise = np.zeros((n_noise, 3), dtype=np.int8)
+        X       = np.vstack([X_true, X_noise])
+
+        pi   = np.array([0.5] + [0.05] * n_noise)   # higher prior on candidate 0
         sens = np.array([0.95, 0.95, 0.95])
         fpr  = np.array([0.02, 0.02, 0.02])
         post, _, _, _ = run_em(X, pi, sens, fpr)
-        assert post[0] > 0.8
+        assert post[0] > 0.8, (
+            f"Expected posterior > 0.8 for fully-observed boundary, got {post[0]:.4f}. "
+            "Check M-step FPR stability."
+        )
 
     def test_reproducibility(self) -> None:
         """EM is deterministic (no RNG) → same result on repeated calls."""

@@ -58,8 +58,10 @@ class TestComputeBasicStats:
         assert stats["n_tads"] == 4
 
     def test_basic_median_size(self, domains_a, resolution):
+        # domains_a sizes: [500k, 500k, 1000k, 1000k] kb
+        # median([500, 500, 1000, 1000]) = (500 + 1000) / 2 = 750.0
         stats = compute_basic_stats(domains_a, "chr1", resolution)
-        assert stats["median_size_kb"] == pytest.approx(500.0)
+        assert stats["median_size_kb"] == pytest.approx(750.0)
 
     def test_basic_coverage(self, domains_a, resolution):
         stats = compute_basic_stats(domains_a, "chr1", resolution)
