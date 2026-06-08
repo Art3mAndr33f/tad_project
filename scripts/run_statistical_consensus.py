@@ -45,6 +45,10 @@ from src.statistical_methods.permutation_chipseq import (
     save_permutation_results,
 )
 from src.statistical_methods.changepoint_tad import run_pelt_tad
+from src.statistical_methods.probabilistic_boundary import (
+    compute_probabilistic_consensus,
+    save_probabilistic_consensus,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -492,6 +496,139 @@ def _update_summary(new_rows: list[dict], summary_path: Path) -> pd.DataFrame:
     return combined
 
 
+def run_probabilistic(
+    chrom: str,
+    resolution: int,
+    cfg: dict,
+    tracks: list[str],
+) -> list[dict]:
+    """Run Method 5: probabilistic EM boundary consensus."""
+    rows: list[dict] = []
+
+    # ── Collect TAD files ─────────────────────────────────────────────────────
+    tad_dir   = Path(cfg.get("paths", {}).get("tads_out", "results/tads"))
+    algo_list = list(cfg.get("algorithms", {}).keys())
+    if not algo_list:
+        pattern   = f"*_{chrom}_{resolution}bp.bed"
+        algo_list = [
+            p.name.replace(f"_{chrom}_{resolution}bp.bed", "")
+            for p in tad_dir.glob(pattern)
+        ]
+
+    exclude = list(
+        cfg.get("weighted_consensus", {}).get(
+            "exclude_from_sources", ["weak_consensus", "strong_consensus"]
+        )
+    )
+    tad_files: dict[str, Path] = {
+        algo: tad_dir / f"{algo}_{chrom}_{resolution}bp.bed"
+        for algo in algo_list
+        if algo not in exclude
+        and (tad_dir / f"{algo}_{chrom}_{resolution}bp.bed").exists()
+    }
+
+    if not tad_files:
+        logger.warning(
+            "[probabilistic] no TAD BED files found for %s@%dbp", chrom, resolution
+        )
+        for track in tracks:
+            rows.append(_empty_row("probabilistic", chrom, resolution, track))
+        return rows
+
+    # ── Build weights_meta from summary CSV ───────────────────────────────────
+    wc_cfg      = cfg.get("weighted_consensus", {})
+    w_track     = str(wc_cfg.get("weight_track", "rad21"))
+    excl_v      = list(wc_cfg.get("exclude_verdicts", ["NO_DATA", "SHIFTED"]))
+    summary_csv = str(_path(cfg, "chipseq_validation_summary",
+                            "results/stats/chipseq_validation_summary.csv"))
+
+    weights_meta: dict[str, dict] = {}
+    if Path(summary_csv).exists():
+        import pandas as _pd
+        sumdf = _pd.read_csv(summary_csv)
+        sumdf = sumdf[sumdf["track"].str.lower() == w_track.lower()]
+        for _, row in sumdf.iterrows():
+            algo    = str(row["algorithm"])
+            verdict = str(row["verdict"]).strip()
+            cr      = float(row["center_ratio"]) if str(row["center_ratio"]) != "nan" else 1.0
+            nb      = int(row["n_boundaries"])   if str(row["n_boundaries"])  != "nan" else 0
+            if algo in exclude or verdict in excl_v:
+                continue
+            weights_meta[algo] = {"center_ratio": cr, "n_boundaries": nb}
+    else:
+        logger.warning("[probabilistic] summary CSV not found: %s", summary_csv)
+        # Fallback: neutral priors
+        for algo in tad_files:
+            weights_meta[algo] = {"center_ratio": 1.0, "n_boundaries": 100}
+
+    # ── Optional: load Hi-C matrix for prior ─────────────────────────────────
+    matrix = None
+    try:
+        from src.data_prep import get_matrix as _get_matrix  # noqa: PLC0415
+        matrix = _get_matrix(cfg, chrom, resolution)
+        logger.info(
+            "[probabilistic] Hi-C matrix loaded for %s@%dbp, shape=%s",
+            chrom, resolution,
+            matrix.shape if matrix is not None else "None",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[probabilistic] could not load Hi-C matrix (%s) — uniform prior",
+            exc,
+        )
+
+    # ── Run EM ────────────────────────────────────────────────────────────────
+    df = compute_probabilistic_consensus(
+        tad_files=tad_files,
+        weights_meta=weights_meta,
+        chrom=chrom,
+        resolution=resolution,
+        cfg=cfg,
+        matrix=matrix,
+    )
+
+    n_bnd = len(df)
+    logger.info(
+        "[probabilistic] %s@%dbp: %d boundaries (theta=%.2f)",
+        chrom, resolution, n_bnd,
+        float(cfg.get("probabilistic", {}).get("theta", 0.5)),
+    )
+
+    cons_dir = Path(cfg.get("paths", {}).get("consensus_out", "results/consensus"))
+    stats_dir = Path(cfg.get("paths", {}).get("stats_out", "results/stats"))
+    bed_path  = cons_dir  / f"probabilistic_boundary_{chrom}_{resolution}bp.bed"
+    csv_path  = stats_dir / f"probabilistic_boundary_{chrom}_{resolution}bp.csv"
+
+    if n_bnd > 0:
+        save_probabilistic_consensus(df, bed_path, csv_path=csv_path)
+    else:
+        logger.warning("[probabilistic] 0 boundaries — BED not written")
+
+    for track in tracks:
+        cr = _center_ratio_for_bed(bed_path, track, chrom, resolution, cfg)              if n_bnd > 0 else None
+        rows.append({
+            "method":        "probabilistic",
+            "chrom":         chrom,
+            "resolution_bp": resolution,
+            "track":         track,
+            "n_boundaries":  n_bnd,
+            "theta":         float(cfg.get("probabilistic", {}).get("theta", 0.5)),
+            "weight_track":  w_track,
+            "center_ratio":  cr,
+            "output_file":   str(bed_path) if n_bnd > 0 else "",
+        })
+
+    return rows
+
+
+def _empty_row(method: str, chrom: str, resolution: int, track: str) -> dict:
+    return {
+        "method": method, "chrom": chrom, "resolution_bp": resolution,
+        "track": track, "n_boundaries": 0, "theta": float("nan"),
+        "weight_track": "n/a", "center_ratio": float("nan"), "output_file": "",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -528,9 +665,10 @@ python scripts/run_statistical_consensus.py \\
         help="ChIP-seq tracks for enrichment validation (default: rad21)",
     )
     p.add_argument(
-        "--methods", nargs="+", default=["weighted", "permutation", "pelt"],
-        choices=["weighted", "permutation", "pelt"],
-        help="Methods to run (default: all three)",
+        "--methods", nargs="+",
+        default=["weighted", "permutation", "pelt", "probabilistic"],
+        choices=["weighted", "permutation", "pelt", "probabilistic"],
+        help="Methods to run (default: all four)",
     )
     p.add_argument(
         "--config", default="config/config.yaml",
@@ -577,6 +715,13 @@ def main() -> None:
                 all_rows.extend(rows)
             except Exception as exc:  # noqa: BLE001
                 logger.error("[pelt] %s: unexpected error — %s", chrom, exc)
+
+        if "probabilistic" in args.methods:
+            try:
+                rows = run_probabilistic(chrom, args.resolution, cfg, args.tracks)
+                all_rows.extend(rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("[probabilistic] %s: unexpected error — %s", chrom, exc)
 
     # ── Summary ──────────────────────────────────────────────────────────────
     if all_rows:
